@@ -20,11 +20,16 @@ package org.apache.flink.ml.preprocessing
 import breeze.linalg._
 import breeze.numerics._
 import breeze.linalg.{DenseVector => BDV, SparseVector => BSV, Vector => BV, DenseMatrix => BDM}
+
 import scala.collection.immutable.HashMap
 import scala.collection.mutable
+import scala.collection.JavaConverters._
 
 import org.apache.flink.api.scala._
+import org.apache.flink.api.common.functions.RichMapFunction
 import org.apache.flink.ml.common.{LabeledVector, Parameter, ParameterMap}
+import org.apache.flink.ml.math.Breeze._
+import org.apache.flink.configuration.Configuration
 
 /*
  * Basic and distributed primitives for Info-Theory computations: Mutual Information (MI)
@@ -45,10 +50,10 @@ class InfoTheory extends Serializable {
   /**
    * Computes MI between two variables using histograms as input data.
    * 
-   * @param data RDD of tuples (feature, 2-dim histogram).
+   * @param data DataSet of tuples (feature, 2-dim histogram).
    * @param yProb Vector of proportions for the secondary feature.
    * @param nInstances Number of instances.
-   * @result A RDD of tuples (feature, MI).
+   * @result A DataSet of tuples (feature, MI).
    * 
    */
   protected def computeMutualInfo(
@@ -58,23 +63,35 @@ class InfoTheory extends Serializable {
     
     val env = ExecutionEnvironment.getExecutionEnvironment;
     val yprob = env.fromElements(yProb.toArray)
-    val result = data.map({ tuple =>
-      var mi = 0.0d
-      val m = tuple._2
-      val byProb = getRuntimeContext().getBroadcastVariable[String]("byProb").asScala
-      // Aggregate by row (x)
-      val xProb = sum(m(*, ::)).map(_.toFloat / nInstances)
-      for(i <- 0 until m.rows){
-        for(j <- 0 until m.cols){
-          val pxy = m(i, j).toFloat / nInstances
-          val py = byProb(j); val px = xProb(i)
-          // To avoid NaNs
-          if(pxy != 0 && px != 0 && py != 0){
-            mi += pxy * (math.log(pxy / (px * py)) / math.log(2))
-          }             
-        }
-      } 
-      (tuple._1, mi)        
+    
+    
+    val result = data.map( new RichMapFunction[(Int, BDM[Long]), (Int, Float)]() {
+      var byProb: Array[Float] = null
+
+      override def open(config: Configuration): Unit = {
+        // 3. Access the broadcasted DataSet as a Collection
+        byProb = getRuntimeContext().getBroadcastVariable[Float]("byProb").asScala.toArray
+      }
+  
+      def map(tuple: (Int, BDM[Long])): (Int, Float) = {
+        var mi = 0.0d
+        val m = tuple._2
+        // Aggregate by row (x)
+        val xProb = sum(m(*, ::)).map(_.toFloat / nInstances)
+        for(i <- 0 until m.rows){
+          for(j <- 0 until m.cols){
+            val pxy = m(i, j).toFloat / nInstances
+            val py = byProb(j); val px = xProb(i)
+            // To avoid NaNs
+            if(pxy != 0 && px != 0 && py != 0){
+              mi += pxy * (math.log(pxy / (px * py)) / math.log(2))
+            }             
+          }
+        } 
+        (tuple._1, mi.toFloat)
+      }
+      
+              
     }).withBroadcastSet(yprob, "byProb");
     result
   }
@@ -82,13 +99,13 @@ class InfoTheory extends Serializable {
   /**
    * Computes MI and CMI between three variables using histograms as input data.
    * 
-   * @param data RDD of tuples (feature, 3-dim histogram).
+   * @param data DataSet of tuples (feature, 3-dim histogram).
    * @param varY Index of the secondary feature.
    * @param varZ Index of the conditional feature.
-   * @param marginalProb RDD of tuples (feature, marginal vector)
-   * @param jointProb RDD of tuples (feature, joint matrices)
-   * @param n Number of instances.
-   * @result A RDD of tuples (feature, CMI).
+   * @param marginalProb DataSet of tuples (feature, marginal vector)
+   * @param jointProb DataSet of tuples (feature, joint matrices)
+   * @param n Number of instances.*
+   * @result A DataSet of tuples (feature, CMI).
    * 
    */
   protected def computeConditionalMutualInfo(
@@ -100,12 +117,14 @@ class InfoTheory extends Serializable {
       n: Long) = {
 
     val env = ExecutionEnvironment.getExecutionEnvironment;
-    val yProb = sc.broadcast(marginalProb.lookup(varY)(0))
-    val zProb = sc.broadcast(marginalProb.lookup(varZ)(0))
-    val yzProb = sc.broadcast(jointProb.lookup(varY)(0))    
-
-    val result = data.mapValues({ m =>
+    val yProb = marginalProb.filter( _._1 == varY).collect()(0)
+    val zProb = marginalProb.filter( _._1 == varZ).collect()(0)
+    val yzProb = jointProb.filter( _._1 == varY).collect()(0)    
+    val broadVar = env.fromElements(yProb._2.fromBreeze)
+    
+    val result = data.map({ tuple =>
       var cmi = 0.0d; var mi = 0.0d
+      val m = tuple._2
       // Aggregate values by row (X)
       val aggX = m.map(h1 => sum(h1(*, ::)).toDenseVector)
       // Use the previous variable to sum up and so obtaining X accumulators 
@@ -113,6 +132,10 @@ class InfoTheory extends Serializable {
       // Aggregate all matrices in Z to obtain the joint probabilities for X and Y
       val xyProb = m.reduce(_ + _).apply(0).map(_.toFloat / n)  
       val xzProb = aggX.map(_.map(_.toFloat / n))
+      
+      // Broadcast variables
+      val broadVar = getRuntimeContext().getBroadcastVariable[String]("broadVar").asScala
+      
       
       for(z <- 0 until m.length){
         for(x <- 0 until m(z).rows){
@@ -131,8 +154,8 @@ class InfoTheory extends Serializable {
           }            
         }
       } 
-      (mi.toFloat, cmi.toFloat)        
-    })
+      tuple._1 -> (mi.toFloat, cmi.toFloat)        
+    }).withBroadcastSet(broadVar, "broadVar");
     result
   }
   
@@ -147,7 +170,7 @@ class InfoTheory extends Serializable {
  * and caches the relevance values, and the marginal and joint proportions derived 
  * from this operation.
  * 
- * @param data RDD of tuples (feature, values).
+ * @param data DataSet of tuples (feature, values).
  * @param fixedFeat Index of the fixed attribute (usually the class). 
  * @param nInstances Number of samples.
  * @param nFeatures Number of features.
@@ -160,9 +183,9 @@ class InfoTheorySparse (
     val nFeatures: Int) extends InfoTheory with Serializable {
   
   // Broadcast the class attribute (fixed)
-  val fixedVal = data.lookup(fixedFeat)(0)  
-  val fixedCol = (fixedFeat, data.context.broadcast(fixedVal))
-  val fixedColHistogram = computeFrequency(fixedCol._2.value, nInstances)
+  val fixedVal = data.filter(_._1 == fixedFeat)(0)  
+  val fixedCol = (fixedFeat, fixedVal)
+  val fixedColHistogram = computeFrequency(fixedVal, nInstances)
   
   // Compute and cache the relevance values, and the marginal and joint proportions
   val (marginalProb, jointProb, relevances) = {
@@ -199,7 +222,7 @@ class InfoTheorySparse (
    * a secondary variable (Y) and a conditional variable (already cached).
    * 
    * @param varY Index of the secondary feature (class).
-   * @result A RDD of tuples (feature, (redundancy, conditional redundancy)).
+   * @result A DataSet of tuples (feature, (redundancy, conditional redundancy)).
    * 
    */
   def getRedundancies(
@@ -223,15 +246,15 @@ class InfoTheorySparse (
    * Computes 2-dim histograms for all input attributes with respect to 
    * a secondary variable (class).
    * 
-   * @param RDD of tuples (feature, values)
+   * @param DataSet of tuples (feature, values)
    * @param ycol (feature, values).
    * @param yhist Histogram for variable Y (class).
    * 
-   * @result A RDD of tuples (feature, histogram).
+   * @result A DataSet of tuples (feature, histogram).
    * 
    */
   private def computeHistograms(
-      filterData:  RDD[(Int, BV[Byte])],
+      filterData:  DataSet[(Int, BV[Byte])],
       ycol: (Int, Broadcast[BV[Byte]]),
       yhist: Map[Byte, Long]) = {
     
@@ -260,14 +283,14 @@ class InfoTheorySparse (
    * a secondary variable and the conditional variable. Conditional feature 
    * (class) must be already cached. 
    * 
-   * @param filterData RDD of tuples (feature, values)
+   * @param filterData DataSet of tuples (feature, values)
    * @param ycol (feature, value vector).
    * 
-   * @result A RDD of tuples (feature, histogram).
+   * @result A DataSet of tuples (feature, histogram).
    * 
    */
   private def computeConditionalHistograms(
-    filterData: RDD[(Int, BV[Byte])],
+    filterData: DataSet[(Int, BV[Byte])],
     ycol: (Int, BV[Byte])) = {
     
       // Compute the histogram for variable Y and get its values.
@@ -329,14 +352,14 @@ class InfoTheorySparse (
  * and caches the relevance values, and the marginal and joint proportions derived 
  * from this operation.
  * 
- * @param data RDD of tuples (feature, values).
+ * @param data DataSet of tuples (feature, values).
  * @param fixedFeat Index of the fixed attribute (usually the class). 
  * @param nInstances Number of samples.
  * @param nFeatures Number of features.
  *
  */
 class InfoTheoryDense (
-    val data: RDD[(Int, Array[Byte])], 
+    val data: DataSet[(Int, Array[Byte])], 
     fixedFeat: Int,
     val nInstances: Long,      
     val nFeatures: Int,
@@ -384,7 +407,7 @@ class InfoTheoryDense (
    * a secondary variable (Y) and a conditional variable (already cached).
    * 
    * @param varY Index of the secondary feature (class).
-   * @result A RDD of tuples (feature, (redundancy, conditional redundancy)).
+   * @result A DataSet of tuples (feature, (redundancy, conditional redundancy)).
    * 
    */
   def getRedundancies(varY: Int) = {
@@ -411,15 +434,15 @@ class InfoTheoryDense (
    * Computes 2-dim histograms for all input attributes 
    * with respect to a secondary variable (class).
    * 
-   * @param RDD of tuples (feature, values)
+   * @param DataSet of tuples (feature, values)
    * @param ycol (feature, values).
    * @param yhist Histogram for variable Y (class).
    * 
-   * @result A RDD of tuples (feature, histogram).
+   * @result A DataSet of tuples (feature, histogram).
    * 
    */
   private def computeHistograms(
-      data:  RDD[(Int, Array[Byte])],
+      data:  DataSet[(Int, Array[Byte])],
       ycol: (Int, Broadcast[Array[Array[Byte]]])) = {
     
     val maxSize = 256; val bycol = ycol._2
@@ -447,16 +470,16 @@ class InfoTheoryDense (
    * a secondary variable and the conditional variable. Conditional feature 
    * (class) must be already cached. 
    * 
-   * @param filterData RDD of tuples (feature, values)
+   * @param filterData DataSet of tuples (feature, values)
    * @param ycol (feature, value vector).
    * 
-   * @result A RDD of tuples (feature, histogram).
+   * @result A DataSet of tuples (feature, histogram).
    * 
    */
   private def computeConditionalHistograms(
-    data: RDD[(Int, Array[Byte])],
+    data: DataSet[(Int, Array[Byte])],
     ycol: (Int, Array[Array[Byte]]),
-    zcol: (Int, Broadcast[Array[Array[Byte]]])) = {
+    zcol: (Int, Array[Array[Byte]])) = {
     
       val bycol = data.context.broadcast(ycol._2)
       val bzcol = zcol._2
@@ -464,7 +487,7 @@ class InfoTheoryDense (
       val ys = counterByFeat.value.getOrElse(ycol._1, 256)
       val zs = counterByFeat.value.getOrElse(zcol._1, 256)
       
-      val result = data.mapPartitions({ it =>
+      val result = data.mapPartition({ it =>
         var result = Map.empty[Int, BDV[BDM[Long]]]
         // For each feature and block, this generates a 3-dim histogram (several matrices)
       for((index, arr) <- it) {
@@ -483,7 +506,6 @@ class InfoTheoryDense (
         result.toIterator
       }).reduceByKey(_ + _) // Matrices are aggregated
       
-      bycol.unpersist()
       result
   }
   
@@ -496,14 +518,14 @@ object InfoTheory {
    * This apply this primitives to all the input attributes with respect to a fixed variable
    * (typically the class) and a secondary (changing) variable, typically the last selected feature.
    *
-   * @param   data RDD of tuples in columnar format (feature, vector).
+   * @param   data DataSet of tuples in columnar format (feature, vector).
    * @param   fixedFeat Index of the fixed attribute (usually the class).
    * @param   nInstances Number of samples.
    * @param   nFeatures Number of features.
    * @return  An info-theory object which contains the relevances and some proportions cached.
    * 
    */
-  def initializeSparse(data: RDD[(Int, BV[Byte])], 
+  def initializeSparse(data: DataSet[(Int, BV[Byte])], 
     fixedFeat: Int,
     nInstances: Long,      
     nFeatures: Int) = {
@@ -515,14 +537,14 @@ object InfoTheory {
    * This apply this primitives to all the input attributes with respect to a fixed variable
    * (typically the class) and a secondary (changing) variable, typically the last selected feature.
    *
-   * @param   data RDD of tuples in columnar format (feature, (block, vector)).
+   * @param   data DataSet of tuples in columnar format (feature, (block, vector)).
    * @param   fixedFeat Index of the fixed attribute (usually the class).
    * @param   nInstances Number of samples.
    * @param   nFeatures Number of features.
    * @return  An info-theory object which contains the relevances and some proportions cached.
    * 
    */
-  def initializeDense(data: RDD[(Int, Array[Byte])], 
+  def initializeDense(data: DataSet[(Int, Array[Byte])], 
     fixedFeat: Int,
     nInstances: Long,      
     nFeatures: Int,
@@ -539,7 +561,7 @@ object InfoTheory {
    * @param n Number of elements
    * 
    */
-  private[feature] def entropy(freqs: Seq[Long], n: Long) = {
+  private[preprocessing] def entropy(freqs: Seq[Long], n: Long) = {
     freqs.aggregate(0.0)({ case (h, q) =>
       h + (if (q == 0) 0  else (q.toDouble / n) * (math.log(q.toDouble / n) / math.log(2)))
     }, { case (h1, h2) => h1 + h2 }) * -1
@@ -550,7 +572,7 @@ object InfoTheory {
    *
    * @param freqs Frequencies of each different class
    */
-  private[feature] def entropy(freqs: Seq[Long]): Double = {
+  private[preprocessing] def entropy(freqs: Seq[Long]): Double = {
     entropy(freqs, freqs.reduce(_ + _))
   }
   
