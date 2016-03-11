@@ -18,9 +18,11 @@
 package org.apache.flink.ml.preprocessing
 
 import scala.collection.mutable.ArrayBuilder
-
-import org.apache.spark.annotation.Experimental
-import org.apache.spark.mllib.linalg._
+import org.apache.flink.api.scala._
+import org.apache.flink.api.common.functions.RichMapFunction
+import org.apache.flink.ml.common.{LabeledVector, Parameter, ParameterMap}
+import org.apache.flink.configuration.Configuration
+import org.apache.flink.ml.math._
 
 /**
  * Feature utils object for selector methods.
@@ -35,7 +37,7 @@ object FeatureUtils {
    * @param features vector
    * @param filterIndices indices of features to filter, must be ordered asc
    */
-  private[feature] def compress(features: Vector, filterIndices: Array[Int]): Vector = {
+  private[preprocessing] def compress(features: Vector, filterIndices: Array[Int]): Vector = {
     features match {
       case v: SparseVector =>
         val newSize = filterIndices.length
@@ -50,7 +52,7 @@ object FeatureUtils {
           filterIndicesIdx = filterIndices(j)
           if (indicesIdx == filterIndicesIdx) {
             newIndices += j
-            newValues += v.values(i)
+            newValues += v.data(i)
             j += 1
             i += 1
           } else {
@@ -62,9 +64,9 @@ object FeatureUtils {
           }
         }
         // TODO: Sparse representation might be ineffective if (newSize ~= newValues.size)
-        Vectors.sparse(newSize, newIndices.result(), newValues.result())
+        new SparseVector(newSize, newIndices.result(), newValues.result())
       case v: DenseVector =>
-        Vectors.dense(filterIndices.map(i => v.values(i)))
+        new DenseVector(filterIndices.map(i => v.data(i)))
       case other =>
         throw new UnsupportedOperationException(
           s"Only sparse and dense vectors are supported but got ${other.getClass}.")
