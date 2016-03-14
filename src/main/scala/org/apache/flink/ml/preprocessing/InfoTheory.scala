@@ -19,7 +19,6 @@ package org.apache.flink.ml.preprocessing
 
 import breeze.linalg._
 import breeze.numerics._
-import breeze.numerics._
 import breeze.linalg.{DenseVector => BDV, SparseVector => BSV, Vector => BV, DenseMatrix => BDM, Matrix => BM}
 
 import scala.collection.immutable.HashMap
@@ -573,14 +572,81 @@ class InfoTheoryDense (
             }
             for(hist <- result.toIterator) out.collect(hist)
         }
-    }
+      }
       // Map operation to compute histogram per feature
       val hist = data.mapPartition(func).withBroadcastSet(ydcol, "bycol");
-       
-    // Matrices are aggregated
-    hist.groupBy(_._1).reduce{ (h1, h2) => h1._1 -> (h1._2 + h2._2) }
+         
+      // Matrices are aggregated
+      hist.groupBy(_._1).reduce{ (h1, h2) => h1._1 -> (h1._2 + h2._2) }
   }
   
+  
+}
+
+object InfoTheory {
+  
+  /**
+   * Creates an Info-Theory object to compute MI and CMI using a greedy approach (sparse version). 
+   * This apply this primitives to all the input attributes with respect to a fixed variable
+   * (typically the class) and a secondary (changing) variable, typically the last selected feature.
+   *
+   * @param   data RDD of tuples in columnar format (feature, vector).
+   * @param   fixedFeat Index of the fixed attribute (usually the class).
+   * @param   nInstances Number of samples.
+   * @param   nFeatures Number of features.
+   * @return  An info-theory object which contains the relevances and some proportions cached.
+   * 
+   */
+  def initializeSparse(data: DataSet[(Int, BV[Byte])], 
+    fixedFeat: Int,
+    nInstances: Long,      
+    nFeatures: Int) = {
+      new InfoTheorySparse(data, fixedFeat, nInstances, nFeatures)
+  }
+  
+  /**
+   * Creates an Info-Theory object to compute MI and CMI using a greedy approach (dense version). 
+   * This apply this primitives to all the input attributes with respect to a fixed variable
+   * (typically the class) and a secondary (changing) variable, typically the last selected feature.
+   *
+   * @param   data RDD of tuples in columnar format (feature, (block, vector)).
+   * @param   fixedFeat Index of the fixed attribute (usually the class).
+   * @param   nInstances Number of samples.
+   * @param   nFeatures Number of features.
+   * @return  An info-theory object which contains the relevances and some proportions cached.
+   * 
+   */
+  def initializeDense(data: DataSet[(Int, Array[Byte])], 
+    fixedFeat: Int,
+    nInstances: Long,      
+    nFeatures: Int,
+    originalNPart: Int) = {
+      new InfoTheoryDense(data, fixedFeat, nInstances, nFeatures, originalNPart)
+  }
+  
+  private val log2 = { x: Double => math.log(x) / math.log(2) } 
+  
+  /**
+   * Calculate entropy for the given frequencies.
+   *
+   * @param freqs Frequencies of each different class
+   * @param n Number of elements
+   * 
+   */
+  private[preprocessing] def entropy(freqs: Seq[Long], n: Long) = {
+    freqs.aggregate(0.0)({ case (h, q) =>
+      h + (if (q == 0) 0  else (q.toDouble / n) * (math.log(q.toDouble / n) / math.log(2)))
+    }, { case (h1, h2) => h1 + h2 }) * -1
+  }
+
+  /**
+   * Calculate entropy for the given frequencies.
+   *
+   * @param freqs Frequencies of each different class
+   */
+  private[preprocessing] def entropy(freqs: Seq[Long]): Double = {
+    entropy(freqs, freqs.reduce(_ + _))
+  }
   
 }
 
