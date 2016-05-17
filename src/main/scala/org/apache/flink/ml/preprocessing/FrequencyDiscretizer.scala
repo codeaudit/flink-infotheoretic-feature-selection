@@ -27,12 +27,12 @@ import org.apache.flink.ml.math.Breeze._
 import org.apache.flink.ml.math.{BreezeVectorConverter, Vector, DenseVector}
 import org.apache.flink.ml.pipeline.{TransformOperation, FitOperation,
 Transformer}
-import org.apache.flink.ml.preprocessing.FrequencyDiscretizer.Splits
+import org.apache.flink.ml.preprocessing.FrequencyDiscretizer.{Splits, NBuckets, Seed}
 import org.apache.flink.api.scala.utils.DataSetUtils
 import org.apache.flink.util.XORShiftRandom
-
 import scala.reflect.ClassTag
 import scala.collection.mutable
+import org.apache.flink.ml.common.LabeledVector
 
 /** Scales observations, so that all features have a user-specified mean and standard deviation.
   * By default for [[StandardScaler]] transformer mean=0.0 and std=1.0.
@@ -63,6 +63,8 @@ import scala.collection.mutable
 class FrequencyDiscretizer extends Transformer[FrequencyDiscretizer] {
 
   private[preprocessing] var splits: Option[Array[Array[Float]]] = None
+  private[preprocessing] var nbuckets: Int = 2
+  private[preprocessing] var seed: Long = 481366818L 
 
   /** Sets the target mean of the transformed data
     *
@@ -74,6 +76,19 @@ class FrequencyDiscretizer extends Transformer[FrequencyDiscretizer] {
     parameters.add(Splits, splits)
     this
   }
+  
+  def setNBuckets(nb: Int): FrequencyDiscretizer = {
+    require(nb > 2)
+    parameters.add(NBuckets, nb)
+    this
+  }
+  
+  def setSeed(s: Long): FrequencyDiscretizer = {
+    parameters.add(Seed, s)
+    this
+  }
+  
+  
 }
 
 object FrequencyDiscretizer {
@@ -107,14 +122,14 @@ object FrequencyDiscretizer {
     * @tparam T Input data type which is a subtype of [[Vector]]
     * @return
     */
-  implicit def fitVectorStandardScaler = new FitOperation[FrequencyDiscretizer, Vector] {
-    override def fit(instance: FrequencyDiscretizer, fitParameters: ParameterMap, input: DataSet[Vector]): Unit = {
+  implicit def fitLabeledVectorDiscretizer = new FitOperation[FrequencyDiscretizer, LabeledVector] {
+    override def fit(instance: FrequencyDiscretizer, fitParameters: ParameterMap, input: DataSet[LabeledVector]): Unit = {
        val map = instance.parameters ++ fitParameters
 
       // retrieve parameters of the algorithm
       val nbuckets = map(NBuckets)
       val seed = map(Seed)
-      val splits = extractSplits(input, nbuckets, seed)
+      val splits = extractSplits(input.map(_.vector), nbuckets, seed)
       require(checkAllSplits(splits))      
       instance.splits = Some(splits)
     }
@@ -239,12 +254,13 @@ object FrequencyDiscretizer {
         var i = 0
         val n = s.length - 1
         while (i < n) {
-          if (s(i) >= s(i + 1)) return false
+          if (s(i) >= s(i + 1)) 
+            return false
           i += 1
         }
         true
       }
-    }.filter(_ == false).length > 0
+    }.filter(_ == false).length == 0
   }
 
   /**
@@ -280,8 +296,8 @@ object FrequencyDiscretizer {
     extends TransformOperation[
         FrequencyDiscretizer, 
         Array[Array[Float]], 
-        Vector, 
-        Vector] {
+        LabeledVector, 
+        LabeledVector] {
 
     var splits: Array[Array[Float]] = _
 
@@ -300,12 +316,13 @@ object FrequencyDiscretizer {
       result.map(_._2)
     }
 
-    def discretize(
-      vector: Vector,
+    override def transform(
+      lvector: LabeledVector,
       model: Array[Array[Float]])
-    : Vector = {
+    : LabeledVector = {
       val splits = model
-      new DenseVector((0 until vector.size).map(ifeat => binarySearchForBuckets(splits(ifeat), vector(ifeat))).toArray)
+      val newFeat = (0 until lvector.vector.size).map(ifeat => binarySearchForBuckets(splits(ifeat), lvector.vector(ifeat)))
+      new LabeledVector(lvector.label, new DenseVector(newFeat.toArray))
     }
   }
 
@@ -317,10 +334,10 @@ object FrequencyDiscretizer {
   implicit def transformVectors = {
     new FrequencyDiscretizerTransformOperation() {
       override def transform(
-          vector: Vector,
+          vector: LabeledVector,
           model: Array[Array[Float]])
-        : Vector = {
-        discretize(vector, model)
+        : LabeledVector = {
+        transform(vector, model)
       }
     }
   }

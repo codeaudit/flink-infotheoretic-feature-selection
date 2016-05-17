@@ -20,11 +20,8 @@ package org.apache.flink.ml.preprocessing
 import breeze.linalg._
 import breeze.numerics._
 import breeze.linalg.{DenseVector => BDV, SparseVector => BSV, Vector => BV, DenseMatrix => BDM, Matrix => BM}
-
-import scala.collection.immutable.HashMap
 import scala.collection.mutable
 import scala.collection.JavaConverters._
-
 import org.apache.flink.api.scala._
 import org.apache.flink.api.common.functions.RichMapFunction
 import org.apache.flink.ml.common.{LabeledVector, Parameter, ParameterMap}
@@ -32,6 +29,8 @@ import org.apache.flink.configuration.Configuration
 import org.apache.flink.ml.math.{DenseMatrix, DenseVector}
 import org.apache.flink.api.common.functions.RichMapPartitionFunction
 import org.apache.flink.util.Collector
+import scala.collection.mutable.ArrayBuffer
+import org.apache.flink.ml.common.FlinkMLTools
 
 
 /*
@@ -64,8 +63,8 @@ class InfoTheory {
       yProb: Array[Float],
       nInstances: Long) = {   
     
-    val env = ExecutionEnvironment.getExecutionEnvironment;
-    val yprob = env.fromElements(yProb)
+    val env = ExecutionEnvironment.getExecutionEnvironment
+    val yprob = env.fromCollection(yProb)
     
     
     val result = data.map( new RichMapFunction[(Int, Array[Array[Long]]), (Int, Float)]() {
@@ -197,43 +196,47 @@ class InfoTheory {
  * @param nFeatures Number of features.
  *
  */
-class InfoTheorySparse (
-    val data: DataSet[(Int, BV[Byte])], 
+class InfoTheorySparse ( 
     fixedFeat: Int,
-    val nInstances: Long,      
-    val nFeatures: Int) extends InfoTheory with Serializable {
+    nInstances: Long,      
+    nFeatures: Int) extends InfoTheory with Serializable {
   
-  // Broadcast the class attribute (fixed)
-  val fixedVal = data.filter(_._1 == fixedFeat).collect()(0)._2
-  val fixedCol = (fixedFeat, fixedVal)
-  val fixedColHistogram = computeFrequency(fixedVal, nInstances)
+
   
-    // Compute and cache the relevance values, and the marginal and joint proportions
-  val (marginalProb, jointProb, relevances) = {
-    val histograms = computeHistograms(data, 
-      fixedCol._2, fixedColHistogram)
-    val jointTable = histograms.map(h => h._1 -> h._2.map(_.map(_.toFloat / nInstances)))
-    val marginalTable = jointTable.map(h => h._1 -> h._2.map(_.sum))
+  def initialize(data: DataSet[(Int, BDV[Byte])]) = {
+    // Broadcast the class attribute (fixed)
+    val fixedVal = data.filter(_._1 == fixedFeat).collect()(0)._2
+    val fixedCol = (fixedFeat, fixedVal)
+    val fixedColHistogram = computeFrequency(fixedVal, nInstances)
     
-    // Remove the class attribute from the computations
-    val label = nFeatures - 1 
-    val fdata = histograms.filter(_._1 != label)
-    val marginalY = marginalTable.filter(_._1 == fixedFeat).collect()(0)._2
-    
-    // Compute MI between all input features and the class (relevances)
-    val relevances = computeMutualInfo(fdata, marginalY, nInstances)
-    (marginalTable, jointTable, relevances)
+      // Compute and cache the relevance values, and the marginal and joint proportions
+    val triple = {
+      val histograms = computeHistograms(data, fixedCol._2, fixedColHistogram)
+      val jointTable = histograms.map(h => h._1 -> h._2.map(_.map(_.toFloat / nInstances)))
+      val marginalTable = jointTable.map(h => h._1 -> h._2.map(_.sum))
+      
+      // Remove the class attribute from the computations
+      val label = nFeatures - 1 
+      val fdata = histograms.filter(_._1 != label)
+      val marginalY = marginalTable.filter(_._1 == fixedFeat).collect()(0)._2
+      
+      // Compute MI between all input features and the class (relevances)
+      val relevances = computeMutualInfo(fdata, marginalY, nInstances)
+      val (mt, jt, rev) = FlinkMLTools.persist(marginalTable, jointTable, relevances, 
+          "/tmp/marginal-prob", "/tmp/joint-prob", "/tmp/relev-prob")
+      (mt, jt, rev, fixedVal)
+      
+      
+    } 
+    triple
   }
   
-  
-  private def computeFrequency(data: BV[Byte], nInstances: Long) = {
+  private def computeFrequency(data: BDV[Byte], nInstances: Long) = {
     val tmp = data.activeValuesIterator.toArray
       .groupBy(l => l).map(t => (t._1, t._2.size.toLong))
     val lastElem = (0: Byte, nInstances - tmp.filter({case (v, _) => v != 0}).values.sum)
     tmp + lastElem
   }
-  
-  def getRelevances(varY: Int) = relevances
   
     /**
    * Computes simple and conditional redundancy for all input attributes with respect to 
@@ -243,15 +246,18 @@ class InfoTheorySparse (
    * @result A DataSet of tuples (feature, (redundancy, conditional redundancy)).
    * 
    */
-  def getRedundancies(
+  def getRedundancies(data: DataSet[(Int, BDV[Byte])],
+      marginalProb: DataSet[(Int, Array[Float])], 
+      jointProb: DataSet[(Int, Array[Array[Float]])],
       varY: Int) = {
     
     // Get and broadcast Y and the fixed variable
     val ycol = data.filter(_._1 == varY).collect()(0)._2
-    val (varZ, zcol) = fixedCol
-
+    val zcol = data.filter(_._1 == fixedFeat).collect()(0)._2
+    val varZ = fixedFeat
+    
     // Compute conditional histograms for all variables with respect to Y and the fixed variable
-    val histograms3d = computeConditionalHistograms(data, (varY, ycol), (varZ, zcol))
+    val histograms3d = computeConditionalHistograms(data, (varY, ycol), (fixedFeat, zcol))
         .filter(h => h._1 != varZ && h._1 != varY)
     data.filter(_._1 == fixedFeat).collect()(0)
     // Compute CMI and MI for all input variables with respect to Y and Z
@@ -271,16 +277,16 @@ class InfoTheorySparse (
    * 
    */
   private def computeHistograms(
-      filterData:  DataSet[(Int, BV[Byte])],
-      ycol: BV[Byte],
+      filterData:  DataSet[(Int, BDV[Byte])],
+      ycol: BDV[Byte],
       yhist: Map[Byte, Long]) = {
     
     // Distinct values for Y
     val ys = if(ycol.size > 0) ycol.activeValuesIterator.max + 1 else 1
     val env = ExecutionEnvironment.getExecutionEnvironment
-    val ydcol = env.fromElements(ycol.toArray)
+    val ydcol = env.fromCollection(ycol.toArray)
     
-    val result = filterData.map( new RichMapFunction[(Int, BV[Byte]), (Int, Array[Array[Long]])]() {
+    val result = filterData.map( new RichMapFunction[(Int, BDV[Byte]), (Int, Array[Array[Long]])]() {
       var bycol: Array[Byte] = null
 
       override def open(config: Configuration): Unit = {
@@ -288,7 +294,7 @@ class InfoTheorySparse (
         bycol = getRuntimeContext().getBroadcastVariable[Byte]("bycol").asScala.toArray
       }
       
-      def map(tuple: (Int, BV[Byte])): (Int, Array[Array[Long]]) = {
+      def map(tuple: (Int, BDV[Byte])): (Int, Array[Array[Long]]) = {
         val xs = if(tuple._2.size > 0) tuple._2.activeValuesIterator.max + 1 else 1 
         val result = Array.ofDim[Long](xs, ys)
         
@@ -321,47 +327,47 @@ class InfoTheorySparse (
    * 
    */
   private def computeConditionalHistograms(
-    filterData: DataSet[(Int, BV[Byte])],
-    ycol: (Int, BV[Byte]),
-    zcol: (Int, BV[Byte])) = {
+    filterData: DataSet[(Int, BDV[Byte])],
+    ycol: (Int, BDV[Byte]),
+    zcol: (Int, BDV[Byte])) = {
           
       
-      val env = ExecutionEnvironment.getExecutionEnvironment      
+      val env = ExecutionEnvironment.getExecutionEnvironment
       
       // Compute the histogram for variable Y and get its values.
       //val bycol = filterData.context.broadcast(ycol._2)      
       val yhist = new mutable.HashMap[(Byte, Byte), Long]()
       ycol._2.activeIterator.foreach({case (inst, y) => 
-          val z = fixedCol._2(inst)
+          val z = zcol._2(inst)
           yhist += (y, z) -> (yhist.getOrElse((y, z), 0L) + 1)
       })      
       //val byhist = filterData.context.broadcast(yhist)
       
       // Get the vector for the conditional variable and compute its histogram
-      val zhist = fixedColHistogram
+      val zhist = computeFrequency(zcol._2, nInstances)
       
       // Get the maximum sizes for both single variables
       val ys = if(ycol._2.size > 0) ycol._2.activeValuesIterator.max + 1 else 1
-      val zs = if(fixedCol._2.size > 0) fixedCol._2.activeValuesIterator.max + 1 else 1
+      val zs = if(zcol._2.size > 0) zcol._2.activeValuesIterator.max + 1 else 1
       
-      val ydcol = env.fromElements((ycol._2.toArray, zcol._2.toArray, yhist, zhist))
+      val ydcol = env.fromElements((ycol._2.toArray, zcol._2.toArray, yhist.toMap, zhist))
       
       // Map operation to compute histogram per feature
-      val result = filterData.map( new RichMapFunction[(Int, BV[Byte]), (Int, BDV[BDM[Long]])]() {
+      val result = filterData.map( new RichMapFunction[(Int, BDV[Byte]), (Int, BDV[BDM[Long]])]() {
         var bycol: Array[Byte] = null
         var bzcol: Array[Byte] = null
-        var byhist: HashMap[(Byte, Byte), Long] = null
+        var byhist: Map[(Byte, Byte), Long] = null
         var bzhist: Map[Byte, Long] = null
         
         override def open(config: Configuration): Unit = {
           // 3. Access the broadcasted DataSet as a Collection
           val aux = getRuntimeContext()
-            .getBroadcastVariable[(Array[Byte], Array[Byte], HashMap[(Byte, Byte), Long], Map[Byte, Long])]("broadVar")
+            .getBroadcastVariable[(Array[Byte], Array[Byte], Map[(Byte, Byte), Long], Map[Byte, Long])]("broadVar")
             .asScala.toArray
           bycol = aux(0)._1; bzcol = aux(0)._2; byhist = aux(0)._3; bzhist = aux(0)._4;
         }
         
-        def map(tuple: (Int, BV[Byte])): (Int, BDV[BDM[Long]]) = {
+        def map(tuple: (Int, BDV[Byte])): (Int, BDV[BDM[Long]]) = {
            // Initialization
           val xs = if(tuple._2.size > 0) tuple._2.activeValuesIterator.max + 1 else 1
           val result = BDV.fill[BDM[Long]](zs){
@@ -386,7 +392,7 @@ class InfoTheorySparse (
           })
           tuple._1 -> result
         }
-    }).withBroadcastSet(ydcol, "bycol");
+    }).withBroadcastSet(ydcol, "broadVar");
     
     result
   }
@@ -408,43 +414,49 @@ class InfoTheorySparse (
  * @param nFeatures Number of features.
  *
  */
-class InfoTheoryDense (
-    val data: DataSet[(Int, Array[Byte])], 
-    fixedFeat: Int,
-    val nInstances: Long,      
-    val nFeatures: Int,
-    val originalNPart: Int) extends InfoTheory with Serializable {
+class InfoTheoryDense (fixedFeat: Int,
+    nInstances: Long,      
+    nFeatures: Int,
+    originalNPart: Int) extends InfoTheory with Serializable {
     
-  // Count the number of distinct values per feature to limit the size of matrices
-  val counterByFeat = data.map(t => if(!t._2.isEmpty) (t._1, t._2.max + 1) else (t._1, 1))
-          .groupBy(_._1)
-          .reduce{ (v1, v2) => if(v1._2 > v2._2) v1 else v2 }
-          .collect()
-          .toMap
   
-  // Broadcast fixed attribute
-  val fixedCol = {
-    val min = fixedFeat * originalNPart
-    val yvals = data.filter{ t => t._1 >= min && t._1 <= (min + originalNPart - 1) }.collect()
-    val ycol = Array.ofDim[Array[Byte]](yvals.length)
-    yvals.foreach({ case (b, v) => ycol(b % originalNPart) = v })
-    fixedFeat -> ycol
-  }
-          
-  // Compute and cache the relevance values, and the marginal and joint proportions derived
-  val (marginalProb, jointProb, relevances) = {
-    val histograms = computeHistograms(data, fixedCol)
-    val jointTable = histograms.map(h => h._1 -> h._2.map(_.map(_.toFloat / nInstances)))
+    
+  def initialize(data: DataSet[((Int, Int), Array[Byte])]) = {
+    // Count the number of distinct values per feature to limit the size of matrices
+    val counterByFeat = data.map(t => if(!t._2.isEmpty) (t._1._1, t._2.max + 1) else (t._1._1, 1))
+            .groupBy(_._1)
+            .reduce{ (v1, v2) => if(v1._2 > v2._2) v1 else v2 }
+            .collect()
+            .toMap
+    
+    // Broadcast fixed attribute
+    val fixedCol = {
+      val min = fixedFeat * originalNPart
+      val key = fixedFeat
+      //val yvals = data.filter{ t => t._1 >= min && t._1 <= (min + originalNPart - 1) }.collect()
+      val yvals = data.filter{ t => t._1._1 == key }.collect().toArray
+      //val ycol: scala.collection.mutable.ArrayBuffer[Byte] = ArrayBuffer()
+      //for(yblock <- yvals) ycol ++= yblock
+      val ycol = Array.ofDim[Array[Byte]](yvals.length)
+      yvals.foreach({ case ((_, b), v) => ycol(b) = v })
+      fixedFeat -> ycol
+    }
+            
+    // Compute and cache the relevance values, and the marginal and joint proportions derived
+    val histograms = computeHistograms(data, fixedCol, counterByFeat)
+    val ni = nInstances
+    val jointTable = histograms.map(h => h._1 -> h._2.map(_.map(_.toFloat / ni)))
     val marginalTable = jointTable.map(h => h._1 -> h._2.map(_.sum))    
     
     // Remove output feature from the computations and compute MI with respect to the fixed var
-    val fdata = histograms.filter{t => t._1 != fixedFeat}
-    val marginalY = marginalTable.filter{t => t._1 == fixedFeat}.collect()(0)._2
+    val key = fixedFeat
+    val fdata = histograms.filter{t => t._1 != key}
+    val marginalY = marginalTable.filter{t => t._1 == key}.collect()(0)._2
     val relevances = computeMutualInfo(fdata, marginalY, nInstances)
-    (marginalTable, jointTable, relevances)
+    val (mt, jt, rev) = FlinkMLTools.persist(marginalTable, jointTable, relevances, "/tmp/marginal-prob", "/tmp/joint-prob", "/tmp/relev-prob")
+
+    (mt, jt, rev, fixedCol._2, counterByFeat)    
   }
-    
-  def getRelevances(varY: Int) = relevances
   
   /**
    * Computes simple and conditional redundancy for all input attributes with respect to 
@@ -454,21 +466,26 @@ class InfoTheoryDense (
    * @result A DataSet of tuples (feature, (redundancy, conditional redundancy)).
    * 
    */
-  def getRedundancies(varY: Int) = {
+  def getRedundancies(data: DataSet[((Int, Int), Array[Byte])],
+      varY: Int, 
+      marginalProb: DataSet[(Int, Array[Float])],
+      jointProb: DataSet[(Int, Array[Array[Float]])],
+      fixedCol: Array[Array[Byte]],
+      counterByFeat: Map[Int, Int]) = {
     
     // Get and broadcast Y and the fixed variable (conditional)
     val min = varY * originalNPart
-    val yvals = data.filter{ t => t._1 >= min && t._1 <= (min + originalNPart - 1) }.collect()
+    //val yvals = data.filter{ t => t._1 >= min && t._1 <= (min + originalNPart - 1) }.collect()
+    val yvals = data.filter{ t => t._1._1 == varY }.collect().toArray
     var ycol = Array.ofDim[Array[Byte]](yvals.length)
-    yvals.foreach({ case (b, v) => ycol(b % originalNPart) = v })
-    val (varZ, _) = fixedCol
+    yvals.foreach({ case ((_, b), v) => ycol(b) = v })
 
     // Compute histograms for all variables with respect to Y and the fixed variable
-    val histograms3d = computeConditionalHistograms(data, (varY, ycol), fixedCol)
-        .filter{ h => h._1 != varZ && h._1 != varY}
+    val histograms3d = computeConditionalHistograms(data, (varY, ycol), (fixedFeat, fixedCol), counterByFeat)
+        .filter{ h => h._1 != fixedFeat && h._1 != varY}
       
     // Compute CMI and MI for all histograms with respect to two variables
-    computeConditionalMutualInfo(histograms3d, varY, varZ, 
+    computeConditionalMutualInfo(histograms3d, varY, fixedFeat, 
         marginalProb, jointProb, nInstances)
   }
   
@@ -485,23 +502,32 @@ class InfoTheoryDense (
    * 
    */
   private def computeHistograms(
-      data:  DataSet[(Int, Array[Byte])],
-      ycol: (Int, Array[Array[Byte]])) = {
+      data:  DataSet[((Int, Int), Array[Byte])],
+      ycol: (Int, Array[Array[Byte]]),
+      counter: Map[Int, Int]) = {
     
     val maxSize = 256; val bycol = ycol._2
-    val counter = counterByFeat 
     val ys = counter.getOrElse(ycol._1, maxSize).toInt
-      
+    
+    println("counter: " + counter.toString())
+    
     data.mapPartition({ it =>
       var result = Map.empty[Int, BDM[Long]]
       // For each feature and block, this generates a histogram (a single matrix)
-      for((index, arr) <- it) {
-        val feat = index / originalNPart
-        val block = index % originalNPart
+      for(((feat, block), arr) <- it) {
+        //val feat = index / originalNPart
+        //val block = index % originalNPart
+        println("X axis: " + counter.getOrElse(feat, maxSize).toInt)
+        println("Y axis: " + ys)
         val m = result.getOrElse(feat, 
             BDM.zeros[Long](counter.getOrElse(feat, maxSize).toInt, ys)) 
-        for(i <- 0 until arr.length) 
-          m(arr(i), bycol(block)(i)) += 1
+        for(i <- 0 until arr.length) {
+          //println("bycol: " + bycol(block).length)
+          //println("length: " + arr.length)
+          val y = bycol(block)(i)
+          val x = arr(i)
+          m(x,y) += 1
+        }
         result += feat -> m
       }
       result.toSeq
@@ -530,9 +556,10 @@ class InfoTheoryDense (
    * 
    */
   private def computeConditionalHistograms(
-    data: DataSet[(Int, Array[Byte])],
+    data: DataSet[((Int, Int), Array[Byte])],
     ycol: (Int, Array[Array[Byte]]),
-    zcol: (Int, Array[Array[Byte]])) = {
+    zcol: (Int, Array[Array[Byte]]),
+    counterByFeat: Map[Int, Int]) = {
     
     
       val env = ExecutionEnvironment.getExecutionEnvironment
@@ -541,7 +568,7 @@ class InfoTheoryDense (
       
       val ydcol = env.fromElements((ycol._2.toArray, zcol._2.toArray, counterByFeat))
       
-      val func = new RichMapPartitionFunction[(Int, Array[Byte]), (Int, BDV[BDM[Long]])]() {
+      val func = new RichMapPartitionFunction[((Int, Int), Array[Byte]), (Int, BDV[BDM[Long]])]() {
         var bycol: Array[Array[Byte]] = null
         var bzcol: Array[Array[Byte]] = null
         var bcounter: Map[Int, Int] = null
@@ -554,12 +581,12 @@ class InfoTheoryDense (
           bycol = aux(0)._1; bzcol = aux(0)._2; bcounter = aux(0)._3;
         }
         
-        def mapPartition(values: java.lang.Iterable[(Int, Array[Byte])], out: Collector[(Int, BDV[BDM[Long]])]): Unit = {
+        def mapPartition(values: java.lang.Iterable[((Int, Int), Array[Byte])], out: Collector[(Int, BDV[BDM[Long]])]): Unit = {
           var result = Map.empty[Int, BDV[BDM[Long]]]
           // For each feature and block, this generates a 3-dim histogram (several matrices)
-          for((index, arr) <- values.asScala) {
-              val feat = index / originalNPart
-              val block = index % originalNPart
+          for(((feat, block), arr) <- values.asScala) {
+              //val feat = index / originalNPart
+              //val block = index % originalNPart
               // We create a vector (z) of matrices (x,y) to represent a 3-dim matrix
               val m = result.getOrElse(feat, 
                   BDV.fill[BDM[Long]](zs){BDM.zeros[Long](bcounter.getOrElse(feat, 256), ys)})
@@ -574,7 +601,7 @@ class InfoTheoryDense (
         }
       }
       // Map operation to compute histogram per feature
-      val hist = data.mapPartition(func).withBroadcastSet(ydcol, "bycol");
+      val hist = data.mapPartition(func).withBroadcastSet(ydcol, "broadVar");
          
       // Matrices are aggregated
       hist.groupBy(_._1).reduce{ (h1, h2) => h1._1 -> (h1._2 + h2._2) }
@@ -597,11 +624,10 @@ object InfoTheory {
    * @return  An info-theory object which contains the relevances and some proportions cached.
    * 
    */
-  def initializeSparse(data: DataSet[(Int, BV[Byte])], 
-    fixedFeat: Int,
+  def initializeSparse(fixedFeat: Int,
     nInstances: Long,      
     nFeatures: Int) = {
-      new InfoTheorySparse(data, fixedFeat, nInstances, nFeatures)
+      new InfoTheorySparse(fixedFeat, nInstances, nFeatures)
   }
   
   /**
@@ -616,12 +642,11 @@ object InfoTheory {
    * @return  An info-theory object which contains the relevances and some proportions cached.
    * 
    */
-  def initializeDense(data: DataSet[(Int, Array[Byte])], 
-    fixedFeat: Int,
+  def initializeDense(fixedFeat: Int,
     nInstances: Long,      
     nFeatures: Int,
     originalNPart: Int) = {
-      new InfoTheoryDense(data, fixedFeat, nInstances, nFeatures, originalNPart)
+      new InfoTheoryDense(fixedFeat, nInstances, nFeatures, originalNPart)
   }
   
   private val log2 = { x: Double => math.log(x) / math.log(2) } 
