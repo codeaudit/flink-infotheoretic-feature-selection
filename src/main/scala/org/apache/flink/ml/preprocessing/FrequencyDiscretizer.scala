@@ -62,7 +62,7 @@ import org.apache.flink.ml.common.LabeledVector
   */
 class FrequencyDiscretizer extends Transformer[FrequencyDiscretizer] {
 
-  private[preprocessing] var splits: Option[Array[Array[Float]]] = None
+  var splits: Option[Array[Array[Float]]] = None
   private[preprocessing] var nbuckets: Int = 2
   private[preprocessing] var seed: Long = 481366818L 
 
@@ -316,7 +316,7 @@ object FrequencyDiscretizer {
       result.map(_._2)
     }
 
-    override def transform(
+    def split(
       lvector: LabeledVector,
       model: Array[Array[Float]])
     : LabeledVector = {
@@ -337,7 +337,7 @@ object FrequencyDiscretizer {
           vector: LabeledVector,
           model: Array[Array[Float]])
         : LabeledVector = {
-        transform(vector, model)
+        split(vector, model)
       }
     }
   }

@@ -28,6 +28,9 @@ import org.apache.flink.ml.preprocessing.InfoSelector
 import org.apache.flink.ml.MLUtils
 import org.apache.flink.ml.common.ParameterMap
 import org.apache.flink.ml.pipeline.Transformer
+import org.apache.flink.ml.preprocessing.StandardScaler
+import org.apache.flink.ml.common.LabeledVector
+import org.apache.flink.ml.math.DenseVector
 
 /**
  * This example implements a basic Linear Regression  to solve the y = theta0 + theta1*x problem
@@ -84,23 +87,36 @@ object InfoSelectorTest {
     
     //conf.disableForceKryo()
     
-    //val header = "/home/sramirez/datasets/ECBDL14/ECBDL14.header"
-    //val typeConversion = KeelParser.parseHeaderFile(env, header) 
-    //val lines = env.readTextFile("/home/sramirez/datasets/ECBDL14/subSetROS.data")
-    //val training = lines.map(line => KeelParser.parseLabeledPoint(typeConversion, line))  
+    val header = "/home/sramirez/datasets/ECBDL14/ECBDL14.header"
+    val typeConversion = KeelParser.parseHeaderFile(env, header) 
+    val lines = env.readTextFile("/home/sramirez/datasets/ECBDL14/subSetROS.data")
+    val training = lines.map(line => KeelParser.parseLabeledPoint(typeConversion, line))  
     
+    val data = List(LabeledVector(1.0, DenseVector(1.0, 2.0)),
+      LabeledVector(2.0, DenseVector(2.0, 3.0)),
+      LabeledVector(3.0, DenseVector(3.0, 4.0)))
     val training2 = MLUtils.readLibSVM(env, "/home/sramirez/datasets/a1a.txt")
     
-    //val disc = FrequencyDiscretizer().setNBuckets(10)  
-    val selector = InfoSelector().setNFeatures(50)
+    val training3 = env.fromCollection(data)
+    val training4 = env.readTextFile("/home/sramirez/datasets/ECBDL14/disc/subSetROS_disc_data_headers.csv")
+        .filter(!_.startsWith("separation"))
+        .map(line => KeelParser.parseLabeledPoint(typeConversion, line)) 
+    
+    val disc = FrequencyDiscretizer().setNBuckets(10)  
+    val selector = InfoSelector().setNFeatures(15)
+    //val selector = StandardScaler()
     
     // Construct pipeline of standard scaler, polynomial features and multiple linear regression
     //val pipeline = disc.chainTransformer(selector)
     
     // Train pipeline
-    selector.fit(training2)
-   
+    //disc.fit(training)
+    selector.fit(training4)
+    val output = selector.transform(training4)
+    println("Result: " + output.collect().take(10).mkString("\n"))
+    //output.writeAsText("/home/sramirez/datasets/ECBDL14/asd.data")
     //val output = pipeline.transform(training2, new ParameterMap())
-    println("Selected features: " + selector.selectedFeatures.get.mkString(","))
+    //println("Selected features: " + disc.splits.get.apply(0).mkString(","))
+    //println("Selected features: " + selector.selectedFeatures.get.mkString(","))
   }
 }

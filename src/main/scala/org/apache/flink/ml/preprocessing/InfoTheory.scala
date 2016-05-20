@@ -509,21 +509,13 @@ class InfoTheoryDense (fixedFeat: Int,
     val maxSize = 256; val bycol = ycol._2
     val ys = counter.getOrElse(ycol._1, maxSize).toInt
     
-    println("counter: " + counter.toString())
-    
     data.mapPartition({ it =>
       var result = Map.empty[Int, BDM[Long]]
       // For each feature and block, this generates a histogram (a single matrix)
       for(((feat, block), arr) <- it) {
-        //val feat = index / originalNPart
-        //val block = index % originalNPart
-        println("X axis: " + counter.getOrElse(feat, maxSize).toInt)
-        println("Y axis: " + ys)
         val m = result.getOrElse(feat, 
             BDM.zeros[Long](counter.getOrElse(feat, maxSize).toInt, ys)) 
         for(i <- 0 until arr.length) {
-          //println("bycol: " + bycol(block).length)
-          //println("length: " + arr.length)
           val y = bycol(block)(i)
           val x = arr(i)
           m(x,y) += 1

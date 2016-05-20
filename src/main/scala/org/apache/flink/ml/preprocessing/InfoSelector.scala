@@ -145,7 +145,6 @@ object InfoSelector {
         
         val selected = trainOn(input, critFactory, nselect)
         require(isSorted(selected))
-        
         instance.selectedFeatures = Some(selected)
       }
     }
@@ -189,7 +188,7 @@ object InfoSelector {
       result.map(_._2)
     }
 
-    override def transform(
+    def select(
         lp: LabeledVector, 
         filterIndices: Array[Int]) 
       : LabeledVector = {
@@ -231,13 +230,13 @@ object InfoSelector {
     * @tparam T
     * @return
     */
-  implicit def transformVectors = {
+  implicit val transformLabeledVector = {
     new InfoSelectorTransformOperation() {
       override def transform(
           vector: LabeledVector,
           model: Array[Int])
-        : LabeledVector = {
-        transform(vector, model)
+        : LabeledVector = {        
+        select(vector, model)
       }
     }
   }
@@ -409,8 +408,7 @@ object InfoSelector {
         throw new IllegalArgumentException(s"Info-Theoretic Framework requires positive values in range [0, 255]")
       }           
     }
-        
-    println("Performing some computations...")
+    
     // Get basic info
     //val cdata = FlinkMLTools.persist(data, "/tmp/original-data")   
     val cdata = data
@@ -423,8 +421,6 @@ object InfoSelector {
     val classMap = cdata.map(_.label).distinct.collect()
         .zipWithIndex.map(t => t._1 -> t._2.toByte)
         .toMap
-        
-    println("Performing some computations2...")
     
     require(nToSelect < nFeatures)  
     
