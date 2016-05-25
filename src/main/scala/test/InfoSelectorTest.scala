@@ -70,7 +70,6 @@ object InfoSelectorTest {
   def main(args: Array[String]) {
 
     val params: ParameterTool = ParameterTool.fromArgs(args)
-    println("Usage: LinearRegression --input <path> --output <path> --iterations <n>")
 
     // set up execution environment
     val env = ExecutionEnvironment.getExecutionEnvironment
@@ -86,37 +85,51 @@ object InfoSelectorTest {
     conf.registerKryoType(classOf[(Int, breeze.linalg.SparseVector[_])])
     
     //conf.disableForceKryo()
+    // Create a table of parameters (parsing)
+    val paramsFS = args.map({arg =>
+        val param = arg.split("--|=").filter(_.size > 0)
+        param.size match {
+          case 2 =>  (param(0) -> param(1))
+          case _ =>  ("" -> "")
+        }
+    }).toMap  
     
-    val header = "/home/sramirez/datasets/ECBDL14/ECBDL14.header"
+    println("Parameters: " + paramsFS.toString())
+    
+    val fileType = paramsFS.getOrElse("type", "keel") 
+    val input = paramsFS.getOrElse("input", "/home/sramirez/datasets/ECBDL14/disc/subSetROS_disc_data_headers.csv") 
+    val header = paramsFS.getOrElse("header", "/home/sramirez/datasets/ECBDL14/subSetROS.data")
+    val nfeat = paramsFS.getOrElse("nfeat", "15").toInt
+    
+    
     val typeConversion = KeelParser.parseHeaderFile(env, header) 
-    val lines = env.readTextFile("/home/sramirez/datasets/ECBDL14/subSetROS.data")
-    val training = lines.map(line => KeelParser.parseLabeledPoint(typeConversion, line))  
+    val lines = env.readTextFile(input).map(line => KeelParser.parseLabeledPoint(typeConversion, line))  
     
-    val data = List(LabeledVector(1.0, DenseVector(1.0, 2.0)),
+    /*val data = List(LabeledVector(1.0, DenseVector(1.0, 2.0)),
       LabeledVector(2.0, DenseVector(2.0, 3.0)),
       LabeledVector(3.0, DenseVector(3.0, 4.0)))
     val training2 = MLUtils.readLibSVM(env, "/home/sramirez/datasets/a1a.txt")
     
-    val training3 = env.fromCollection(data)
-    val training4 = env.readTextFile("/home/sramirez/datasets/ECBDL14/disc/subSetROS_disc_data_headers.csv")
-        .filter(!_.startsWith("separation"))
+    val training3 = env.fromCollection(data)*/
+    val training = env.readTextFile("/home/sramirez/datasets/ECBDL14/disc/subSetROS_disc_data_headers.csv")
+        .filter(l => !l.startsWith("separation") && !l.startsWith("@"))
         .map(line => KeelParser.parseLabeledPoint(typeConversion, line)) 
     
-    val disc = FrequencyDiscretizer().setNBuckets(10)  
-    val selector = InfoSelector().setNFeatures(15)
-    //val selector = StandardScaler()
+    //val disc = FrequencyDiscretizer().setNBuckets(10)  
+    val selector = InfoSelector().setNFeatures(nfeat)
     
     // Construct pipeline of standard scaler, polynomial features and multiple linear regression
     //val pipeline = disc.chainTransformer(selector)
     
     // Train pipeline
-    //disc.fit(training)
-    selector.fit(training4)
-    val output = selector.transform(training4)
+    val initStartTime = System.nanoTime()
+    selector.fit(training)
+    println("Selected features: " + selector.selectedFeatures.get.mkString(","))
+    val FSTime = (System.nanoTime() - initStartTime) / 1e9
+    println("FS time: " + FSTime)
+    
+    //pipeline.fit(training)
+    val output = selector.transform(training)    
     println("Result: " + output.collect().take(10).mkString("\n"))
-    //output.writeAsText("/home/sramirez/datasets/ECBDL14/asd.data")
-    //val output = pipeline.transform(training2, new ParameterMap())
-    //println("Selected features: " + disc.splits.get.apply(0).mkString(","))
-    //println("Selected features: " + selector.selectedFeatures.get.mkString(","))
   }
 }

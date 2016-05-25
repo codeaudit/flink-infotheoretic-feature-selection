@@ -249,17 +249,16 @@ class InfoTheorySparse (
   def getRedundancies(data: DataSet[(Int, BDV[Byte])],
       marginalProb: DataSet[(Int, Array[Float])], 
       jointProb: DataSet[(Int, Array[Array[Float]])],
+      fixedCol: BDV[Byte],
       varY: Int) = {
     
     // Get and broadcast Y and the fixed variable
     val ycol = data.filter(_._1 == varY).collect()(0)._2
-    val zcol = data.filter(_._1 == fixedFeat).collect()(0)._2
     val varZ = fixedFeat
     
     // Compute conditional histograms for all variables with respect to Y and the fixed variable
-    val histograms3d = computeConditionalHistograms(data, (varY, ycol), (fixedFeat, zcol))
+    val histograms3d = computeConditionalHistograms(data, (varY, ycol), (fixedFeat, fixedCol))
         .filter(h => h._1 != varZ && h._1 != varY)
-    data.filter(_._1 == fixedFeat).collect()(0)
     // Compute CMI and MI for all input variables with respect to Y and Z
     computeConditionalMutualInfo(histograms3d, varY, varZ, 
         marginalProb, jointProb, nInstances)
@@ -329,20 +328,17 @@ class InfoTheorySparse (
   private def computeConditionalHistograms(
     filterData: DataSet[(Int, BDV[Byte])],
     ycol: (Int, BDV[Byte]),
-    zcol: (Int, BDV[Byte])) = {
-          
+    zcol: (Int, BDV[Byte])) = {         
       
       val env = ExecutionEnvironment.getExecutionEnvironment
       
-      // Compute the histogram for variable Y and get its values.
-      //val bycol = filterData.context.broadcast(ycol._2)      
+      // Compute the histogram for variable Y and get its values. 
       val yhist = new mutable.HashMap[(Byte, Byte), Long]()
       ycol._2.activeIterator.foreach({case (inst, y) => 
           val z = zcol._2(inst)
           yhist += (y, z) -> (yhist.getOrElse((y, z), 0L) + 1)
       })      
-      //val byhist = filterData.context.broadcast(yhist)
-      
+            
       // Get the vector for the conditional variable and compute its histogram
       val zhist = computeFrequency(zcol._2, nInstances)
       
@@ -475,7 +471,6 @@ class InfoTheoryDense (fixedFeat: Int,
     
     // Get and broadcast Y and the fixed variable (conditional)
     val min = varY * originalNPart
-    //val yvals = data.filter{ t => t._1 >= min && t._1 <= (min + originalNPart - 1) }.collect()
     val yvals = data.filter{ t => t._1._1 == varY }.collect().toArray
     var ycol = Array.ofDim[Array[Byte]](yvals.length)
     yvals.foreach({ case ((_, b), v) => ycol(b) = v })

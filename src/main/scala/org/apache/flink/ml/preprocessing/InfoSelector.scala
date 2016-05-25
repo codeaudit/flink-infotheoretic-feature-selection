@@ -364,7 +364,7 @@ object InfoSelector {
     // Iterative process for redundancy and conditional redundancy
     while (selected.size < nToSelect && moreFeat) {
 
-      val red = it.getRedundancies(data.sparse, mt, jt, selected.head.feat)      
+      val red = it.getRedundancies(data.sparse, mt, jt, fcol, selected.head.feat)      
       // Update criteria with the new redundancy values
       red.collect().par.foreach({case (k, (mi, cmi)) =>
          pool(k).update(mi.toFloat, cmi.toFloat) 
@@ -410,15 +410,12 @@ object InfoSelector {
     }
     
     // Get basic info
-    //val cdata = FlinkMLTools.persist(data, "/tmp/original-data")   
-    val cdata = data
-    val first = cdata.first(1).collect()(0)
-    println("Performing some computations1...")
+    val first = data.first(1).collect()(0)
     val dense = first.vector.isInstanceOf[DenseVector]    
-    val nInstances = cdata.count()
+    val nInstances = data.count()
     val nFeatures = first.vector.size + 1
-    val oldNP = cdata.mapPartition(it => Seq(1)).reduce{_ + _}.collect()(0)
-    val classMap = cdata.map(_.label).distinct.collect()
+    val oldNP = data.mapPartition(it => Seq(1)).reduce{_ + _}.collect()(0)
+    val classMap = data.map(_.label).distinct.collect()
         .zipWithIndex.map(t => t._1 -> t._2.toByte)
         .toMap
     
@@ -439,7 +436,7 @@ object InfoSelector {
             for(i <- 0 until nFeatures) out.collect((i, index) -> mat(i).toArray) // numPartitions
           }
         }
-        val denseData = cdata.mapPartition(denseIndexing).partitionByRange(0)
+        val denseData = data.mapPartition(denseIndexing).partitionByRange(0)
       val colpdata = FlinkMLTools.persist(denseData, "/tmp/dense-flink-columnar")      
       ColumnarData(colpdata, null, true, oldNP)    
       
@@ -458,7 +455,7 @@ object InfoSelector {
           }
         }
       }
-      val sparseData = cdata.zipWithIndex.mapPartition(sparseIndexing)
+      val sparseData = data.zipWithIndex.mapPartition(sparseIndexing)
       
       // Transform sparse data into a columnar format 
       // by grouping all values for the same feature in a single vector
@@ -472,15 +469,9 @@ object InfoSelector {
             k = fk
             result(iind.toInt) = v
           }
-            
           k -> result // Feature index -> array of cells
-          /*} else {
-            val init = a.map(_._2).toArray.sortBy(_._1)
-            a(0)._1 -> new BSV(init.map(_._1.toInt), init.map(_._2), nInstances.toInt)
-          }*/
         }.partitionByHash(0)
       val colpdata = FlinkMLTools.persist(columnarData, "/tmp/sparse-flink-columnar")
-      //println("colpdata count: " + colpdata.count())
       ColumnarData(null, colpdata, false, oldNP)
     }
     

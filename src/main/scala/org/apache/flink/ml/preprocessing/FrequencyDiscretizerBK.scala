@@ -27,20 +27,12 @@ import org.apache.flink.ml.math.Breeze._
 import org.apache.flink.ml.math.{BreezeVectorConverter, Vector, DenseVector}
 import org.apache.flink.ml.pipeline.{TransformOperation, FitOperation,
 Transformer}
-import org.apache.flink.ml.preprocessing.FrequencyDiscretizer.{Splits, NBuckets, Seed}
+import org.apache.flink.ml.preprocessing.FrequencyDiscretizerBK.{Splits, NBuckets, Seed}
 import org.apache.flink.api.scala.utils.DataSetUtils
 import org.apache.flink.util.XORShiftRandom
 import scala.reflect.ClassTag
 import scala.collection.mutable
 import org.apache.flink.ml.common.LabeledVector
-import org.apache.flink.ml.pipeline.TransformDataSetOperation
-import org.apache.flink.api.common.functions.RichMapFunction
-import org.apache.flink.configuration.Configuration
-import org.apache.flink.ml.common.LabeledVector
-
-import org.apache.flink.api.common.functions._
-import org.apache.flink.api.scala._
-import scala.collection.JavaConverters._
 
 /** Scales observations, so that all features have a user-specified mean and standard deviation.
   * By default for [[StandardScaler]] transformer mean=0.0 and std=1.0.
@@ -68,7 +60,7 @@ import scala.collection.JavaConverters._
   * - [[Std]]: The standard deviation of the transformed data set; by default
   * equal to 1
   */
-class FrequencyDiscretizer extends Transformer[FrequencyDiscretizer] {
+class FrequencyDiscretizerBK extends Transformer[FrequencyDiscretizerBK] {
 
   var splits: Option[Array[Array[Float]]] = None
   private[preprocessing] var nbuckets: Int = 2
@@ -79,19 +71,19 @@ class FrequencyDiscretizer extends Transformer[FrequencyDiscretizer] {
     * @param mu the user-specified mean value.
     * @return the StandardScaler instance with its mean value set to the user-specified value
     */
-  def setSplits(splits: Array[Array[Float]]): FrequencyDiscretizer = {
-    require(FrequencyDiscretizer.checkAllSplits(splits))
+  def setSplits(splits: Array[Array[Float]]): FrequencyDiscretizerBK = {
+    require(FrequencyDiscretizerBK.checkAllSplits(splits))
     parameters.add(Splits, splits)
     this
   }
   
-  def setNBuckets(nb: Int): FrequencyDiscretizer = {
+  def setNBuckets(nb: Int): FrequencyDiscretizerBK = {
     require(nb > 2)
     parameters.add(NBuckets, nb)
     this
   }
   
-  def setSeed(s: Long): FrequencyDiscretizer = {
+  def setSeed(s: Long): FrequencyDiscretizerBK = {
     parameters.add(Seed, s)
     this
   }
@@ -99,7 +91,7 @@ class FrequencyDiscretizer extends Transformer[FrequencyDiscretizer] {
   
 }
 
-object FrequencyDiscretizer {
+object FrequencyDiscretizerBK {
 
   // ====================================== Parameters =============================================
 
@@ -117,8 +109,8 @@ object FrequencyDiscretizer {
 
   // ==================================== Factory methods ==========================================
 
-  def apply(): FrequencyDiscretizer = {
-    new FrequencyDiscretizer()
+  def apply(): FrequencyDiscretizerBK = {
+    new FrequencyDiscretizerBK()
   }
 
   // ====================================== Operations =============================================
@@ -130,8 +122,8 @@ object FrequencyDiscretizer {
     * @tparam T Input data type which is a subtype of [[Vector]]
     * @return
     */
-  implicit def fitLabeledVectorDiscretizer = new FitOperation[FrequencyDiscretizer, LabeledVector] {
-    override def fit(instance: FrequencyDiscretizer, fitParameters: ParameterMap, input: DataSet[LabeledVector]): Unit = {
+  implicit def fitLabeledVectorDiscretizer = new FitOperation[FrequencyDiscretizerBK, LabeledVector] {
+    override def fit(instance: FrequencyDiscretizerBK, fitParameters: ParameterMap, input: DataSet[LabeledVector]): Unit = {
        val map = instance.parameters ++ fitParameters
 
       // retrieve parameters of the algorithm
@@ -294,40 +286,59 @@ object FrequencyDiscretizer {
       }
     }
   }
-  
-  /** [[org.apache.flink.ml.pipeline.TransformDataSetOperation]] to map a [[LabeledVector]] into the
-    * polynomial feature space
+
+  /** Base class for StandardScaler's [[TransformOperation]]. This class has to be extended for
+    * all types which are supported by [[StandardScaler]]'s transform operation.
+    *
+    * @tparam T
     */
-  implicit val transformLabeledVectorIntoDiscretizerVector =
-    new TransformDataSetOperation[FrequencyDiscretizer, LabeledVector, LabeledVector] {
+  abstract class FrequencyDiscretizerBKTransformOperation
+    extends TransformOperation[
+        FrequencyDiscretizerBK, 
+        Array[Array[Float]], 
+        LabeledVector, 
+        LabeledVector] {
 
-    override def transformDataSet(
-        instance: FrequencyDiscretizer,
-        transformParameters: ParameterMap,
-        input: DataSet[LabeledVector])
-      : DataSet[LabeledVector] = {
+    var splits: Array[Array[Float]] = _
+
+    override def getModel(
+      instance: FrequencyDiscretizerBK, 
+      transformParameters: ParameterMap): DataSet[Array[Array[Float]]] = {
+
       val env = ExecutionEnvironment.getExecutionEnvironment
-      //val splits = transformParameters(Splits)
+      splits = transformParameters(Splits)
 
-      val toBroadcast = instance.splits match {
-        case Some(s) => env.fromCollection(s)
+      val result = instance.splits match {
+        case Some(s) => env.fromElements((0, s))
         case None =>
           throw new RuntimeException("The discretizer has not been fitted to the data. ")
       }
-      
-      input.map(new RichMapFunction[LabeledVector, LabeledVector]() {
-          var broadcastSet: Array[Array[Float]] = null
-      
-          override def open(config: Configuration): Unit = {
-            // 3. Access the broadcasted DataSet as a Collection
-            broadcastSet = getRuntimeContext().getBroadcastVariable[Array[Float]]("broadcastSetName").asScala.toArray
-          }
-      
-          def map(lvector: LabeledVector): LabeledVector = {
-             val newFeat = (0 until lvector.vector.size).map(ifeat => binarySearchForBuckets(broadcastSet(ifeat), lvector.vector(ifeat)))
-             new LabeledVector(lvector.label, new DenseVector(newFeat.toArray))
-          }
-      }).withBroadcastSet(toBroadcast, "broadcastSetName")
+      result.map(_._2)
+    }
+
+    def split(
+      lvector: LabeledVector,
+      model: Array[Array[Float]])
+    : LabeledVector = {
+      val splits = model
+      val newFeat = (0 until lvector.vector.size).map(ifeat => binarySearchForBuckets(splits(ifeat), lvector.vector(ifeat)))
+      new LabeledVector(lvector.label, new DenseVector(newFeat.toArray))
+    }
+  }
+
+  /** [[TransformOperation]] to transform [[Vector]] types
+    *
+    * @tparam T
+    * @return
+    */
+  implicit def transformVectors = {
+    new FrequencyDiscretizerBKTransformOperation() {
+      override def transform(
+          vector: LabeledVector,
+          model: Array[Array[Float]])
+        : LabeledVector = {
+        split(vector, model)
+      }
     }
   }
 }
