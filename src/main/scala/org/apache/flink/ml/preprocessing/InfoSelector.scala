@@ -30,11 +30,13 @@ import org.apache.flink.ml.common.{LabeledVector, Parameter, ParameterMap}
 import org.apache.flink.api.scala._
 import org.apache.flink.ml.math._
 import org.apache.flink.ml.pipeline.{TransformOperation, FitOperation,Transformer}
-import org.apache.flink.ml.preprocessing.InfoSelector.{Selected, NFeatures, Criterion}
+import org.apache.flink.ml.preprocessing.InfoSelector.{Selected, NFeatures, Criterion, NI, NF, Dense}
 import org.apache.flink.util.Collector
 import org.apache.flink.api.scala.utils.`package`.DataSetUtils
 import scala.collection.mutable.ArrayBuffer
 import org.apache.flink.ml.common.FlinkMLTools
+import org.apache.flink.configuration.Configuration
+import org.apache.flink.api.common.functions.RichMapFunction
 
 /** Scales observations, so that all features have a user-specified mean and standard deviation.
   * By default for [[StandardScaler]] transformer mean=0.0 and std=1.0.
@@ -68,14 +70,14 @@ import org.apache.flink.ml.common.FlinkMLTools
   // Case class for columnar data (dense and sparse version)
   case class ColumnarData(dense: DataSet[((Int, Int), Array[Byte])], 
       sparse: DataSet[(Int, BDV[Byte])],
-      isDense: Boolean,
-      originalNPart: Int)
+      isDense: Boolean)
 
 class InfoSelector extends Transformer[InfoSelector] {
 
   var selectedFeatures: Option[Array[Int]] = None
   private[preprocessing] var nfeatures: Int = 10
   private[preprocessing] var criterion: String = "mrmr" 
+  
 
   /** Sets the target mean of the transformed data
     *
@@ -93,7 +95,24 @@ class InfoSelector extends Transformer[InfoSelector] {
     parameters.add(NFeatures, s)
     this
   }
+  
+  def setNF(s: Int): InfoSelector = {
+    require(s > 0)
+    parameters.add(NF, s)
+    this
+  }
 
+  def setNI(s: Int): InfoSelector = {
+    require(s > 0)
+    parameters.add(NI, s)
+    this
+  }
+  
+  def setDense(s: Boolean): InfoSelector = {
+    parameters.add(Dense, s)
+    this
+  }
+  
   def setCriterion(s: String): InfoSelector = {
     parameters.add(Criterion, s)
     this
@@ -111,6 +130,19 @@ object InfoSelector {
   case object NFeatures extends Parameter[Int] {
     val defaultValue = Some(10)
   }
+  
+  case object NF extends Parameter[Int] {
+    val defaultValue = Some(631)
+  }
+  
+  case object NI extends Parameter[Int] {
+    val defaultValue = Some(631)
+  }
+  
+  case object Dense extends Parameter[Boolean] {
+    val defaultValue = Some(true)
+  } 
+  
   case object Criterion extends Parameter[String] {
     val defaultValue = Some("mrmr")
   }
@@ -141,9 +173,13 @@ object InfoSelector {
 
         // retrieve parameters of the algorithm
         val nselect = map(NFeatures)
+        val nf = map(NF)
+        val ni = map(NI)
+        val dense = map(Dense)
+        
         val critFactory = new InfoThCriterionFactory(map(Criterion))
         
-        val selected = trainOn(input, critFactory, nselect)
+        val selected = trainOn(input, critFactory, nselect, nf, ni, dense)
         require(isSorted(selected))
         instance.selectedFeatures = Some(selected)
       }
@@ -240,11 +276,8 @@ object InfoSelector {
       }
     }
   }
-  
-  /*** THE START OF THE ALGORITHM LOGIC ***/
 
-
-  /**
+   /**
    * Performs a info-theory FS process.
    * 
    * @param data Columnar data (last element is the class attribute).
@@ -253,7 +286,7 @@ object InfoSelector {
    * @return A list with the most relevant features and its scores.
    * 
    */
-  private[preprocessing] def selectDenseFeatures(
+  /*private[preprocessing] def selectDenseFeatures(
       data: ColumnarData,
       criterionFactory: InfoThCriterionFactory, 
       nToSelect: Int,
@@ -263,7 +296,7 @@ object InfoSelector {
     val label = nFeatures - 1
     // Initialize all criteria with the relevance computed in this phase. 
     // It also computes and saved some information to be re-used.
-    val it = InfoTheory.initializeDense(label, nInstances, nFeatures, data.originalNPart)
+    val it = InfoTheory.initializeDense(label, nInstances, nFeatures)
     val (mt, jt, rev, fcol, counter)  = it.initialize(data.dense)
 
     // Initialize all (except the class) criteria with the relevance values
@@ -311,6 +344,88 @@ object InfoSelector {
       }
     }
     selected.reverse
+  }*/
+
+  /**
+   * Performs a info-theory FS process.
+   * 
+   * @param data Columnar data (last element is the class attribute).
+   * @param nInstances Number of samples.
+   * @param nFeatures Number of features.
+   * @return A list with the most relevant features and its scores.
+   * 
+   */
+  private[preprocessing] def selectDenseFeatures(
+      data: ColumnarData,
+      criterionFactory: InfoThCriterionFactory, 
+      nToSelect: Int,
+      nInstances: Long,
+      nFeatures: Int) = {
+    
+    val label = nFeatures - 1
+    // Initialize all criteria with the relevance computed in this phase. 
+    // It also computes and saved some information to be re-used.
+    val it = InfoTheory.initializeDense(label, nInstances, nFeatures)
+    val (mt, jt, rev, fcol, counter)  = it.initialize(data.dense)
+
+    // Initialize all (except the class) criteria with the relevance values
+    /*val pool = Array.fill[InfoThCriterion](nFeatures - 1) {
+      val crit = criterionFactory.getCriterion.init(Float.NegativeInfinity)
+      crit.setValid(false)
+    } */   
+    val initial = rev.map({ p => p._1 -> criterionFactory.getCriterion.init(p._2.toFloat) })
+    
+    // Print most relevant features
+    val topByRelevance = initial.collect().sortBy(-_._2.score).take(nToSelect)
+    val strRels = topByRelevance.map({case (f, c) => (f + 1) + "\t" + "%.4f" format c.score})
+      .mkString("\n")
+    println("\n*** MaxRel features ***\nFeature\tScore\n" + strRels) 
+    
+    val func = new RichMapFunction[(Int, InfoThCriterion), (Int, InfoThCriterion)]() {
+        var max: Array[(Int, Float)] = null
+        
+        override def open(config: Configuration): Unit = {
+          // 3. Access the broadcasted DataSet as a Collection
+          val aux = getRuntimeContext()
+            .getBroadcastVariable[(Int, Float)]("max")
+            .asScala.toArray
+         max = aux
+         println("Max: " + max.map(_._2).mkString(","))
+        }
+        
+        def map(c: (Int, InfoThCriterion)): (Int, InfoThCriterion) = { 
+          if(c._1 == max(0)._1) c._1 -> c._2.setValid(false) else c
+        }
+      }
+    
+    val solution = if (criterionFactory.getCriterion.toString == "MIM") {
+      // MIM does not use redundancy, so for this criterion all the features are selected now
+      rev.groupBy(1).sortGroup(1, Order.DESCENDING).first(nToSelect).collect().map({case (id, relv) => F(id, relv)}).reverse
+    } else {
+      // Get the maximum and initialize the set of selected features with it
+      //val max = initial.filter(_._2.valid).map(c => c._1 -> c._2.score).reduce( (c1, c2) => if(c1._2 > c2._2) c1 else c2)
+      //solution = F(max._1.toInt, max._2) +: solution
+      //val selected = initial.map(func).withBroadcastSet(max, "max")
+      //val (mid, max) = initial.map(c => c._1 -> c._2.relevance).max(1).collect()(0)
+      //solution = F(mid.toInt, max) +: solution
+      //val selected = initial.map(c => if(c._1 == mid) c._1 -> c._2.setValid(false) else c)
+      //println("Selected: " + selected.map(c => c._1 -> c._2.valid).collect())
+      
+      val nIter = math.min(nToSelect, nFeatures) - 1
+      val finalSelected = initial.iterate(nIter) { currentSelected =>   
+          val max: DataSet[(Int, Float)] = currentSelected.filter(_._2.valid).map(c => c._1 -> c._2.score).reduce( (c1, c2) => if(c1._2 > c2._2) c1 else c2)
+          val newInfo = it.getRedundancies(data.dense, max, mt, jt, fcol, counter) 
+          val updated = currentSelected.join(newInfo).where(0).equalTo(0){ (f1, f2) =>
+            if(f1._2.valid) f1._1 -> f1._2.update(f2._2._1.toFloat, f2._2._2.toFloat) else f1 
+          }
+          val nmax = updated.filter(_._2.valid).map(c => c._1 -> c._2.score).reduce( (c1, c2) => if(c1._2 > c2._2) c1 else c2)
+          //solution = F(max._1.toInt, max._2) +: solution
+          val newSelected = updated.map(func).withBroadcastSet(nmax, "max")
+          newSelected
+      }
+      finalSelected.filter(!_._2.valid).collect().map({case (id, c) => F(id, c.score)}).toSeq
+    }
+    solution
   }
   
   /**
@@ -364,7 +479,7 @@ object InfoSelector {
     // Iterative process for redundancy and conditional redundancy
     while (selected.size < nToSelect && moreFeat) {
 
-      val red = it.getRedundancies(data.sparse, mt, jt, fcol, selected.head.feat)      
+      val red = it.getRedundancies(data.sparse, mt, jt, fcol, rev)      
       // Update criteria with the new redundancy values
       red.collect().par.foreach({case (k, (mi, cmi)) =>
          pool(k).update(mi.toFloat, cmi.toFloat) 
@@ -391,7 +506,10 @@ object InfoSelector {
    */
   def trainOn(data: DataSet[LabeledVector], 
       criterionFactory: InfoThCriterionFactory, 
-      nToSelect: Int): Array[Int] = {
+      nToSelect: Int,
+      nFeatures: Int,
+      nInstances: Int,
+      dense: Boolean): Array[Int] = {
       
     // Feature vector must be composed of bytes, not the class
     println("Initializing feature selector...")
@@ -410,14 +528,10 @@ object InfoSelector {
     }
     
     // Get basic info
-    val first = data.first(1).collect()(0)
+    /*val first = data.first(1).collect()(0)
     val dense = first.vector.isInstanceOf[DenseVector]    
     val nInstances = data.count()
-    val nFeatures = first.vector.size + 1
-    val oldNP = data.mapPartition(it => Seq(1)).reduce{_ + _}.collect()(0)
-    val classMap = data.map(_.label).distinct.collect()
-        .zipWithIndex.map(t => t._1 -> t._2.toByte)
-        .toMap
+    val nFeatures = first.vector.size + 1*/
     
     require(nToSelect < nFeatures)  
     
@@ -438,7 +552,7 @@ object InfoSelector {
         }
         val denseData = data.mapPartition(denseIndexing).partitionByRange(0)
       val colpdata = FlinkMLTools.persist(denseData, "/tmp/dense-flink-columnar")      
-      ColumnarData(colpdata, null, true, oldNP)    
+      ColumnarData(colpdata, null, true)    
       
     } else {   
         
@@ -448,7 +562,7 @@ object InfoSelector {
           for((iinst, lp) <- it.asScala) {
             requireByteValues(lp.vector)
             val sv = lp.vector.asInstanceOf[SparseVector]
-            val output = (nFeatures - 1) -> (iinst, classMap(lp.label))
+            val output = (nFeatures - 1) -> (iinst, lp.label.toByte)
             out.collect(output)
             for(i <- 0 until sv.indices.length) 
                 out.collect(sv.indices(i) -> (iinst, sv.data(i).toByte))
@@ -472,7 +586,7 @@ object InfoSelector {
           k -> result // Feature index -> array of cells
         }.partitionByHash(0)
       val colpdata = FlinkMLTools.persist(columnarData, "/tmp/sparse-flink-columnar")
-      ColumnarData(null, colpdata, false, oldNP)
+      ColumnarData(null, colpdata, false)
     }
     
     // Start the main algorithm

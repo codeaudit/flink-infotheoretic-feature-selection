@@ -98,12 +98,20 @@ object InfoSelectorTest {
     
     val fileType = paramsFS.getOrElse("type", "keel") 
     val input = paramsFS.getOrElse("input", "/home/sramirez/datasets/ECBDL14/disc/subSetROS_disc_data_headers.csv") 
-    val header = paramsFS.getOrElse("header", "/home/sramirez/datasets/ECBDL14/subSetROS.data")
-    val nfeat = paramsFS.getOrElse("nfeat", "15").toInt
+    val header = paramsFS.getOrElse("header", "/home/sramirez/datasets/ECBDL14/ECBDL14.header")
+    val nf = paramsFS.getOrElse("nf", "631").toInt    
+    val ni = paramsFS.getOrElse("ni", "8000").toInt    
+    val nfeat = paramsFS.getOrElse("nfeat", "10").toInt    
+    val dense = paramsFS.getOrElse("dense", "true").toBoolean
     
-    
-    val typeConversion = KeelParser.parseHeaderFile(env, header) 
-    val lines = env.readTextFile(input).map(line => KeelParser.parseLabeledPoint(typeConversion, line))  
+    val training = if(fileType == "keel"){
+      val typeConversion = KeelParser.parseHeaderFile(env, header) 
+      env.readTextFile(input)
+        .filter(l => !l.startsWith("separation") && !l.startsWith("@"))
+        .map(line => KeelParser.parseLabeledPoint(typeConversion, line))
+    } else {
+      MLUtils.readLibSVM(env, input)
+    }    
     
     /*val data = List(LabeledVector(1.0, DenseVector(1.0, 2.0)),
       LabeledVector(2.0, DenseVector(2.0, 3.0)),
@@ -111,12 +119,9 @@ object InfoSelectorTest {
     val training2 = MLUtils.readLibSVM(env, "/home/sramirez/datasets/a1a.txt")
     
     val training3 = env.fromCollection(data)*/
-    val training = env.readTextFile("/home/sramirez/datasets/ECBDL14/disc/subSetROS_disc_data_headers.csv")
-        .filter(l => !l.startsWith("separation") && !l.startsWith("@"))
-        .map(line => KeelParser.parseLabeledPoint(typeConversion, line)) 
     
     //val disc = FrequencyDiscretizer().setNBuckets(10)  
-    val selector = InfoSelector().setNFeatures(nfeat)
+    val selector = InfoSelector().setNFeatures(nfeat).setNF(nf).setNI(ni).setDense(dense)
     
     // Construct pipeline of standard scaler, polynomial features and multiple linear regression
     //val pipeline = disc.chainTransformer(selector)
