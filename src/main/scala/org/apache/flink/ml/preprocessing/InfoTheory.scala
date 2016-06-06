@@ -598,7 +598,6 @@ class InfoTheoryDense (fixedFeat: Int,
           val aux = getRuntimeContext()
             .getBroadcastVariable[(Int, Array[Byte])]("broadVar")
             .asScala.toArray
-          //println("Aux value: " + aux.map(_._1).mkString(",") )
           bycol = aux.filter(_._1 != -1)
           ys = aux.filter(_._1 == -1)(0)._2(0).toInt
         }
@@ -613,9 +612,6 @@ class InfoTheoryDense (fixedFeat: Int,
               val m = result.getOrElse(feat, 
                   BDV.fill[BDM[Long]](zs){BDM.zeros[Long](counterByFeat.getOrElse(feat, 256), ys)})
               for(i <- 0 until arr.length){
-                //println("block: " + block)
-                //println("asdf0: " + bycol.map(_._1).mkString(","))
-                //println("asdf: " + bycol.filter(_._1 == block).map(_._1).mkString(","))
                 val y = bycol.filter(_._1 == block)(0)._2(i)
                 val z = bzcol(block)(i)
                 m(z)(arr(i), y) += 1

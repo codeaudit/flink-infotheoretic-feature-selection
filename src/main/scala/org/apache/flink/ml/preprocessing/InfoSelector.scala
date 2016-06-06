@@ -37,6 +37,8 @@ import scala.collection.mutable.ArrayBuffer
 import org.apache.flink.ml.common.FlinkMLTools
 import org.apache.flink.configuration.Configuration
 import org.apache.flink.api.common.functions.RichMapFunction
+import org.apache.flink.api.common.functions.RichFilterFunction
+import org.apache.flink.api.common.functions.RichJoinFunction
 
 /** Scales observations, so that all features have a user-specified mean and standard deviation.
   * By default for [[StandardScaler]] transformer mean=0.0 and std=1.0.
@@ -277,75 +279,6 @@ object InfoSelector {
     }
   }
 
-   /**
-   * Performs a info-theory FS process.
-   * 
-   * @param data Columnar data (last element is the class attribute).
-   * @param nInstances Number of samples.
-   * @param nFeatures Number of features.
-   * @return A list with the most relevant features and its scores.
-   * 
-   */
-  /*private[preprocessing] def selectDenseFeatures(
-      data: ColumnarData,
-      criterionFactory: InfoThCriterionFactory, 
-      nToSelect: Int,
-      nInstances: Long,
-      nFeatures: Int) = {
-    
-    val label = nFeatures - 1
-    // Initialize all criteria with the relevance computed in this phase. 
-    // It also computes and saved some information to be re-used.
-    val it = InfoTheory.initializeDense(label, nInstances, nFeatures)
-    val (mt, jt, rev, fcol, counter)  = it.initialize(data.dense)
-
-    // Initialize all (except the class) criteria with the relevance values
-    val pool = Array.fill[InfoThCriterion](nFeatures - 1) {
-      val crit = criterionFactory.getCriterion.init(Float.NegativeInfinity)
-      crit.setValid(false)
-    }    
-    rev.collect().foreach{ case (x, mi) => 
-      pool(x) = criterionFactory.getCriterion.init(mi.toFloat) 
-    }
-    
-    // Print most relevant features
-    val topByRelevance = rev.groupBy(1).sortGroup(1, Order.DESCENDING).first(nToSelect).collect()
-    val strRels = topByRelevance.map({case (f, mi) => (f + 1) + "\t" + "%.4f" format mi})
-      .mkString("\n")
-    println("\n*** MaxRel features ***\nFeature\tScore\n" + strRels) 
-    
-    // Get the maximum and initialize the set of selected features with it
-    val (max, mid) = pool.zipWithIndex.maxBy(_._1.relevance)
-    var selected = Seq(F(mid, max.score))
-    pool(mid).setValid(false)
-      
-    // MIM does not use redundancy, so for this criterion all the features are selected now
-    if (criterionFactory.getCriterion.toString == "MIM") {
-      selected = topByRelevance.map({case (id, relv) => F(id, relv)}).reverse
-    }
-    
-    var moreFeat = true
-    // Iterative process for redundancy and conditional redundancy
-    while (selected.size < nToSelect && moreFeat) {
-
-      val redundancies = it.getRedundancies(data.dense, selected.head.feat, mt, jt, fcol, counter)      
-      // Update criteria with the new redundancy values
-      redundancies.collect().par.foreach({case (k, (mi, cmi)) =>
-         pool(k).update(mi.toFloat, cmi.toFloat) 
-      })
-      
-      // select the best feature and remove from the whole set of features
-      val (max, maxi) = pool.par.zipWithIndex.filter(_._1.valid).maxBy(_._1)
-      if(maxi != -1){
-        selected = F(maxi, max.score) +: selected
-        pool(maxi).setValid(false)
-      } else {
-        moreFeat = false
-      }
-    }
-    selected.reverse
-  }*/
-
   /**
    * Performs a info-theory FS process.
    * 
@@ -379,9 +312,13 @@ object InfoSelector {
     val topByRelevance = initial.collect().sortBy(-_._2.score).take(nToSelect)
     val strRels = topByRelevance.map({case (f, c) => (f + 1) + "\t" + "%.4f" format c.score})
       .mkString("\n")
-    println("\n*** MaxRel features ***\nFeature\tScore\n" + strRels) 
+    println("\n*** MaxRel features ***\nFeature\tScore\n" + strRels)    
     
-    val func = new RichMapFunction[(Int, InfoThCriterion), (Int, InfoThCriterion)]() {
+    val solution = if (criterionFactory.getCriterion.toString == "MIM") {
+      // MIM does not use redundancy, so for this criterion all the features are selected now
+      rev.groupBy(1).sortGroup(1, Order.DESCENDING).first(nToSelect).collect().map({case (id, relv) => F(id, relv)}).reverse
+    } else {      
+      val func = new RichMapFunction[(Int, InfoThCriterion), (Int, InfoThCriterion)]() {
         var max: Array[(Int, Float)] = null
         
         override def open(config: Configuration): Unit = {
@@ -390,40 +327,45 @@ object InfoSelector {
             .getBroadcastVariable[(Int, Float)]("max")
             .asScala.toArray
          max = aux
-         println("Max: " + max.map(_._2).mkString(","))
         }
         
         def map(c: (Int, InfoThCriterion)): (Int, InfoThCriterion) = { 
           if(c._1 == max(0)._1) c._1 -> c._2.setValid(false) else c
         }
-      }
-    
-    val solution = if (criterionFactory.getCriterion.toString == "MIM") {
-      // MIM does not use redundancy, so for this criterion all the features are selected now
-      rev.groupBy(1).sortGroup(1, Order.DESCENDING).first(nToSelect).collect().map({case (id, relv) => F(id, relv)}).reverse
-    } else {
-      // Get the maximum and initialize the set of selected features with it
-      //val max = initial.filter(_._2.valid).map(c => c._1 -> c._2.score).reduce( (c1, c2) => if(c1._2 > c2._2) c1 else c2)
-      //solution = F(max._1.toInt, max._2) +: solution
-      //val selected = initial.map(func).withBroadcastSet(max, "max")
-      //val (mid, max) = initial.map(c => c._1 -> c._2.relevance).max(1).collect()(0)
-      //solution = F(mid.toInt, max) +: solution
-      //val selected = initial.map(c => if(c._1 == mid) c._1 -> c._2.setValid(false) else c)
-      //println("Selected: " + selected.map(c => c._1 -> c._2.valid).collect())
+      } 
       
+      val func2 = new RichMapFunction[(Int, InfoThCriterion), (Int, InfoThCriterion)]() {
+        var mivalues: Map[Int, (Float, Float)] = null
+        
+        override def open(config: Configuration): Unit = {
+          // 3. Access the broadcasted DataSet as a Collection
+          val aux = getRuntimeContext()
+            .getBroadcastVariable[(Int, (Float, Float))]("mivalues")
+            .asScala.toMap
+         mivalues = aux
+        }
+        
+        def map(c: (Int, InfoThCriterion)): (Int, InfoThCriterion) = { 
+          if(c._2.valid) {
+            val miv = mivalues.getOrElse(c._1, .0f -> .0f)
+            c._1 -> c._2.update(miv._1, miv._2)
+          } else {
+            c
+          }
+        }
+      }    
       val nIter = math.min(nToSelect, nFeatures) - 1
       val finalSelected = initial.iterate(nIter) { currentSelected =>   
-          val max: DataSet[(Int, Float)] = currentSelected.filter(_._2.valid).map(c => c._1 -> c._2.score).reduce( (c1, c2) => if(c1._2 > c2._2) c1 else c2)
-          val newInfo = it.getRedundancies(data.dense, max, mt, jt, fcol, counter) 
-          val updated = currentSelected.join(newInfo).where(0).equalTo(0){ (f1, f2) =>
-            if(f1._2.valid) f1._1 -> f1._2.update(f2._2._1.toFloat, f2._2._2.toFloat) else f1 
-          }
-          val nmax = updated.filter(_._2.valid).map(c => c._1 -> c._2.score).reduce( (c1, c2) => if(c1._2 > c2._2) c1 else c2)
-          //solution = F(max._1.toInt, max._2) +: solution
-          val newSelected = updated.map(func).withBroadcastSet(nmax, "max")
-          newSelected
+          val omax: DataSet[(Int, Float)] = currentSelected
+            .filter(_._2.valid)
+            .map(c => c._1 -> c._2.score)
+            .reduce( (c1, c2) => if(c1._2 > c2._2) c1 else c2)    
+          val newInfo = it.getRedundancies(data.dense, omax, mt, jt, fcol, counter)
+          
+          currentSelected.map(func).withBroadcastSet(omax, "max").map(func2).withBroadcastSet(newInfo, "mivalues")
       }
-      finalSelected.filter(!_._2.valid).collect().map({case (id, c) => F(id, c.score)}).toSeq
+      
+      finalSelected.collect().filter(!_._2.valid).map({case (id, c) => F(id, c.score)}).toSeq
     }
     solution
   }
@@ -444,57 +386,7 @@ object InfoSelector {
       nInstances: Long,
       nFeatures: Int) = {
     
-    val label = nFeatures - 1
-    // Initialize all criteria with the relevance computed in this phase. 
-    // It also computes and saved some information to be re-used.
-    val it = InfoTheory.initializeSparse(label, nInstances, nFeatures)
-    val (mt, jt, rev, fcol)  = it.initialize(data.sparse)
-
-    // Initialize all (except the class) criteria with the relevance values
-    val pool = Array.fill[InfoThCriterion](nFeatures - 1) {
-      val crit = criterionFactory.getCriterion.init(Float.NegativeInfinity)
-      crit.setValid(false)
-    }    
-    rev.collect().foreach{ case (x, mi) => 
-      pool(x) = criterionFactory.getCriterion.init(mi.toFloat) 
-    }
-    
-    // Print most relevant features
-    val topByRelevance = rev.groupBy(1).sortGroup(1, Order.DESCENDING).first(nToSelect).collect()
-    val strRels = topByRelevance.map({case (f, mi) => (f + 1) + "\t" + "%.4f" format mi})
-      .mkString("\n")
-    println("\n*** MaxRel features ***\nFeature\tScore\n" + strRels) 
-    
-    // Get the maximum and initialize the set of selected features with it
-    val (max, mid) = pool.zipWithIndex.maxBy(_._1.relevance)
-    var selected = Seq(F(mid, max.score))
-    pool(mid).setValid(false)
-      
-    // MIM does not use redundancy, so for this criterion all the features are selected now
-    if (criterionFactory.getCriterion.toString == "MIM") {
-      selected = topByRelevance.map({case (id, relv) => F(id, relv)}).reverse
-    }
-    
-    var moreFeat = true
-    // Iterative process for redundancy and conditional redundancy
-    while (selected.size < nToSelect && moreFeat) {
-
-      val red = it.getRedundancies(data.sparse, mt, jt, fcol, rev)      
-      // Update criteria with the new redundancy values
-      red.collect().par.foreach({case (k, (mi, cmi)) =>
-         pool(k).update(mi.toFloat, cmi.toFloat) 
-      })
-      
-      // select the best feature and remove from the whole set of features
-      val (max, maxi) = pool.par.zipWithIndex.filter(_._1.valid).maxBy(_._1)
-      if(maxi != -1){
-        selected = F(maxi, max.score) +: selected
-        pool(maxi).setValid(false)
-      } else {
-        moreFeat = false
-      }
-    }
-    selected.reverse
+     throw new UnsupportedOperationException("selectSparseFeatures method is not implemented yet.")
   }
 
   /**
@@ -600,7 +492,7 @@ object InfoSelector {
     }
   
     // Print best features according to the mRMR measure
-    val out = selected.map{case F(feat, rel) => 
+    val out = selected.sortBy{ case F(feat, rel) => -rel}.map{case F(feat, rel) => 
         (feat + 1) + "\t" + "%.4f".format(rel)
       }.mkString("\n")
     println("\n*** Selected features ***\nFeature\tScore\n" + out)
