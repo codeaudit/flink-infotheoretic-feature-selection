@@ -299,7 +299,7 @@ object InfoSelector {
     // Initialize all criteria with the relevance computed in this phase. 
     // It also computes and saved some information to be re-used.
     val it = InfoTheory.initializeDense(label, nInstances, nFeatures)
-    val (mt, jt, rev, fcol, counter)  = it.initialize(data.dense)
+    val (mt, jt, rev, counter)  = it.initialize(data.dense)
 
     // Initialize all (except the class) criteria with the relevance values
     /*val pool = Array.fill[InfoThCriterion](nFeatures - 1) {
@@ -360,7 +360,7 @@ object InfoSelector {
             .filter(_._2.valid)
             .map(c => c._1 -> c._2.score)
             .reduce( (c1, c2) => if(c1._2 > c2._2) c1 else c2)    
-          val newInfo = it.getRedundancies(data.dense, omax, mt, jt, fcol, counter)
+          val newInfo = it.getRedundancies(data.dense, omax, mt, jt, counter)
           
           currentSelected.map(func).withBroadcastSet(omax, "max").map(func2).withBroadcastSet(newInfo, "mivalues")
       }
@@ -443,7 +443,7 @@ object InfoSelector {
           }
         }
         val denseData = data.mapPartition(denseIndexing).partitionByRange(0)
-      val colpdata = FlinkMLTools.persist(denseData, "/tmp/dense-flink-columnar")      
+      val colpdata = FlinkMLTools.persist(denseData, "hdfs://bigdata:8020/tmp/dense-flink-columnar")      
       ColumnarData(colpdata, null, true)    
       
     } else {   
@@ -477,7 +477,7 @@ object InfoSelector {
           }
           k -> result // Feature index -> array of cells
         }.partitionByHash(0)
-      val colpdata = FlinkMLTools.persist(columnarData, "/tmp/sparse-flink-columnar")
+      val colpdata = FlinkMLTools.persist(columnarData, "hdfs://bigdata:8020/tmp/sparse-flink-columnar")
       ColumnarData(null, colpdata, false)
     }
     
