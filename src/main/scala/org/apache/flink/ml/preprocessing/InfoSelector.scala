@@ -302,10 +302,6 @@ object InfoSelector {
     val (mt, jt, rev, counter)  = it.initialize(data.dense)
 
     // Initialize all (except the class) criteria with the relevance values
-    /*val pool = Array.fill[InfoThCriterion](nFeatures - 1) {
-      val crit = criterionFactory.getCriterion.init(Float.NegativeInfinity)
-      crit.setValid(false)
-    } */   
     val initial = rev.map({ p => p._1 -> criterionFactory.getCriterion.init(p._2.toFloat) })
     
     // Print most relevant features
@@ -419,12 +415,7 @@ object InfoSelector {
       }           
     }
     
-    // Get basic info
-    /*val first = data.first(1).collect()(0)
-    val dense = first.vector.isInstanceOf[DenseVector]    
-    val nInstances = data.count()
-    val nFeatures = first.vector.size + 1*/
-    
+    // Get basic info    
     require(nToSelect < nFeatures)  
     
     // Start the transformation to the columnar format
@@ -442,7 +433,7 @@ object InfoSelector {
             for(i <- 0 until nFeatures) out.collect((i, index) -> mat(i).toArray) // numPartitions
           }
         }
-        val denseData = data.mapPartition(denseIndexing).partitionByRange(0)
+      val denseData = data.mapPartition(denseIndexing).partitionByRange(0)
       val colpdata = FlinkMLTools.persist(denseData, "hdfs://bigdata:8020/tmp/dense-flink-columnar")      
       ColumnarData(colpdata, null, true)    
       
